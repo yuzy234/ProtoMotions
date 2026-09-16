@@ -841,6 +841,9 @@ class IsaacGymSimulator(Simulator):
 
         # Apply COM domain randomization to this specific actor (must be done right after actor creation)
         self._apply_com_domain_randomization_to_actor(env_ptr, humanoid_handle, env_id)
+        self._apply_body_mass_domain_randomization_to_actor(
+            env_ptr, humanoid_handle, env_id
+        )
 
         self._humanoid_handles.append(humanoid_handle)
 
@@ -1130,12 +1133,13 @@ class IsaacGymSimulator(Simulator):
 
     # ===== Group 3: Simulation Steps & State Management =====
     def _physics_step(self) -> None:
-        # For BUILT_IN_PD, set targets once before loop (efficiency)
-        # For PROPORTIONAL/TORQUE, apply inside loop (needs fresh DOF state each substep)
-        if self.control_type == ControlType.BUILT_IN_PD:
+        # Without latency, BUILT_IN_PD targets are set once for efficiency.
+        # Latency and the other control modes are applied at each substep.
+        latency_enabled = self._max_action_latency_ms > 0.0
+        if self.control_type == ControlType.BUILT_IN_PD and not latency_enabled:
             self._apply_control()
         for i in range(self.decimation):
-            if self.control_type != ControlType.BUILT_IN_PD:
+            if self.control_type != ControlType.BUILT_IN_PD or latency_enabled:
                 self._apply_control()
             self._simulate()
             if self.device.type == "cpu":
@@ -1628,6 +1632,31 @@ class IsaacGymSimulator(Simulator):
         for idx, body_idx in enumerate(body_indices):
             offset = com_offsets[idx].cpu().numpy().tolist()
             self._update_body_com_and_inertia(body_props[body_idx], offset)
+
+        self._gym.set_actor_rigid_body_properties(
+            env_ptr, humanoid_handle, body_props, recomputeInertia=False
+        )
+
+    def _apply_body_mass_domain_randomization_to_actor(
+        self, env_ptr, humanoid_handle, env_id: int
+    ) -> None:
+        """Apply sampled robot body masses immediately after actor creation."""
+
+        if self._domain_randomization is None or "body_mass" not in self._domain_randomization:
+            return
+
+        body_mass = self._domain_randomization["body_mass"]
+        body_props = self._gym.get_actor_rigid_body_properties(env_ptr, humanoid_handle)
+        bucket_id = env_id % body_mass["mass"].shape[0]
+        for body_offset, body_idx in enumerate(body_mass["body_indices"]):
+            new_mass = float(body_mass["mass"][bucket_id, body_offset].item())
+            old_mass = body_props[body_idx].mass
+            if old_mass <= 0:
+                raise ValueError(
+                    f"Cannot randomize non-positive mass for robot body index {body_idx}."
+                )
+            self._scale_body_inertia(body_props[body_idx], new_mass / old_mass)
+            body_props[body_idx].mass = new_mass
 
         self._gym.set_actor_rigid_body_properties(
             env_ptr, humanoid_handle, body_props, recomputeInertia=False

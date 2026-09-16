@@ -700,12 +700,12 @@ class BaseEnv:
         self._current_noisy_obs = None
 
         # Store current actions
-        self._current_raw_action[:] = action
+        self._current_raw_action[:] = action.detach()
 
         # Process action
         action_dict = self._process_action(action, self.context)
         processed_action = action_dict["processed_action"]
-        self._current_processed_action[:] = processed_action
+        self._current_processed_action[:] = processed_action.detach()
 
         self.simulator.step(processed_action, markers_callback=self.get_markers_state)
 

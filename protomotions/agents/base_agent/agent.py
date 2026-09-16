@@ -702,6 +702,16 @@ class BaseAgent:
             self.fit_start_time = time.time()
         self.fabric.call("on_fit_start", self)
 
+        # Marks the transition from setup (env/scene build, which is what fails or
+        # wedges before training) into the training loop. train_slurm.py's opt-in
+        # startup watchdog disarms on the first "Epoch <n>" line: printing one here,
+        # at loop entry, means it disarms right after the scene build rather than
+        # only at the end of the first (potentially long, silent) data-collection
+        # epoch -- the rich progress line below flushes to a non-TTY log just once,
+        # at 100%, which would leave the watchdog armed through a healthy slow
+        # rollout. flush=True so it reaches the log before that silent window.
+        print(f"Epoch {self.current_epoch}: entering training loop", flush=True)
+
         while self.current_epoch < self.max_epochs:
             self.epoch_start_time = time.time()
 

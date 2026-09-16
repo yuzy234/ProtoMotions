@@ -52,6 +52,14 @@ class GenesisSimulator(Simulator):
         device: torch.device,
         scene_lib: SceneLib,
     ) -> None:
+        if (
+            config.domain_randomization is not None
+            and config.domain_randomization.body_mass is not None
+        ):
+            raise NotImplementedError(
+                "Genesis does not support body-mass domain randomization."
+            )
+
         super().__init__(
             config=config,
             robot_config=robot_config,

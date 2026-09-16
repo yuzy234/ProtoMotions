@@ -1593,3 +1593,37 @@ def test_apply_motion_weights_to_scene_weights_loads_expected_checkpoint(tmp_pat
         )
         is None
     )
+
+
+def test_base_env_step_detaches_actions_before_persisting_them():
+    """Regression for the interactive-eval GPU leak.
+
+    step() records the raw and processed actions with ``buffer[:] = x``. That is a
+    ``copy_``, and ``copy_`` from a tensor that carries a graph turns the
+    previously grad-free buffer into one that requires grad (a ``CopyBackwards``
+    node) -- which pins the entire action graph for the life of the persistent
+    buffer, so an eval loop that steps with graph-carrying actions grows its GPU
+    memory every step. step() must ``.detach()`` before storing.
+
+    This steps a grad-carrying action through the real step()/_process_action path
+    (post_physics_step and get_obs stubbed, mirroring the step test above) and
+    requires the persisted buffers to come back detached. It fails on the pre-fix
+    code (requires_grad True, grad_fn a CopyBackwards) and passes once the stores
+    detach -- so it guards the fix even for a caller that is NOT under
+    torch.no_grad()."""
+    env = _make_env()
+    env.config.action_config = {
+        "fn": lambda action: {"processed_action": action + 1.0},
+    }
+    env.post_physics_step = lambda: None
+    env.get_obs = lambda: {}
+
+    action = torch.ones(3, 2, requires_grad=True) * 2.0
+    assert action.grad_fn is not None  # the action genuinely carries a graph
+
+    BaseEnv.step(env, action)
+
+    for name in ("_current_raw_action", "_current_processed_action"):
+        buf = getattr(env, name)
+        assert not buf.requires_grad, f"{name} still requires grad -> autograd graph leak"
+        assert buf.grad_fn is None, f"{name} kept grad_fn {buf.grad_fn} -> autograd graph leak"

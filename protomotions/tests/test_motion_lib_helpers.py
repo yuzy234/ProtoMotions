@@ -22,6 +22,7 @@ from protomotions.components.motion_lib import (
     MotionFileSwitchMode,
     MotionLib,
     MotionLibConfig,
+    _smooth_contacts_segmented,
     resolve_shard_file,
     select_motion_shard,
 )
@@ -212,6 +213,72 @@ def _populate_motion_lib(motion_lib, motion_lengths, motion_num_frames):
         [sum(motion_num_frames[:i]) for i in range(len(motion_num_frames))],
         dtype=torch.long,
     )
+
+
+def _smooth_contacts_reference(
+    contacts: torch.Tensor,
+    length_starts: torch.Tensor,
+    motion_num_frames: torch.Tensor,
+    window_size: int,
+) -> torch.Tensor:
+    """Reference implementation matching the original per-motion loop."""
+    padding = window_size // 2
+    kernel = torch.ones(
+        1, 1, window_size, device=contacts.device, dtype=torch.float32
+    ) / window_size
+    smoothed = torch.zeros_like(contacts, dtype=torch.float32)
+    for start, num_frames in zip(length_starts.tolist(), motion_num_frames.tolist()):
+        end = start + num_frames
+        motion_contacts = contacts[start:end].float()
+        padded = torch.nn.functional.pad(
+            motion_contacts.t().unsqueeze(1),
+            (padding, padding),
+            mode="replicate",
+        )
+        smoothed_motion = torch.nn.functional.conv1d(padded, kernel)
+        smoothed[start:end] = smoothed_motion.squeeze(1).t()
+    return smoothed
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+def test_smooth_contacts_vectorized_matches_reference_for_variable_lengths(device):
+    """The segmented GPU path must preserve per-motion replicate padding."""
+    generator = torch.Generator(device=device).manual_seed(1234)
+    motion_num_frames = torch.tensor([1, 2, 3, 8, 11], device=device)
+    length_starts = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.long, device=device),
+            motion_num_frames.cumsum(0)[:-1],
+        ]
+    )
+    contacts = torch.randint(
+        0,
+        2,
+        (int(motion_num_frames.sum().item()), 3),
+        generator=generator,
+        device=device,
+        dtype=torch.bool,
+    )
+
+    expected = _smooth_contacts_reference(
+        contacts, length_starts, motion_num_frames, window_size=7
+    )
+    actual = _smooth_contacts_segmented(
+        contacts, length_starts, motion_num_frames, window_size=7
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
 
 
 def _identity_quat(num_frames: int, num_bodies: int) -> torch.Tensor:

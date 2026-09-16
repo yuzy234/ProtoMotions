@@ -35,6 +35,26 @@ def get_friction_table(friction_dr: Dict[str, Any]) -> Optional[torch.Tensor]:
     return friction_dr.get("dynamic_friction")
 
 
+def scale_inertia_for_mass_change(
+    inertia: torch.Tensor, mass_ratio: torch.Tensor
+) -> torch.Tensor:
+    """Scale a per-body inertia by a per-environment mass ratio.
+
+    ``inertia`` is a single body's inertia across environments -- shape
+    ``[num_envs, *inertia_dims]`` -- where ``inertia_dims`` is ``(3, 3)`` for a
+    full inertia matrix (as Newton stores it) or ``(3,)`` for principal moments.
+    ``mass_ratio`` is ``[num_envs]``. Inertia is linear in mass, so every
+    component scales by the same ratio. The ratio is right-padded with singleton
+    dimensions so it broadcasts over the trailing inertia dims; a plain
+    ``mass_ratio.unsqueeze(-1)`` collides with a full ``(3, 3)`` matrix
+    (``[num_envs, 3, 3] * [num_envs, 1]`` fails to broadcast).
+    """
+    ratio = mass_ratio.reshape(
+        mass_ratio.shape + (1,) * (inertia.ndim - mass_ratio.ndim)
+    )
+    return inertia * ratio
+
+
 def build_motion_data(
     recorded_motion: Dict[str, List[torch.Tensor]],
     fps: int,

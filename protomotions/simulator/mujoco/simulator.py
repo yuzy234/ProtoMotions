@@ -33,6 +33,7 @@ from protomotions.simulator.base_simulator.simulator_state import (
     StateConversion,
 )
 from protomotions.simulator.mujoco.config import MujocoSimulatorConfig
+from protomotions.simulator.mujoco.keyboard import MujocoKeyboardWindow
 
 
 def _to_torch_f32(arr: np.ndarray) -> torch.Tensor:
@@ -62,6 +63,14 @@ class MujocoSimulator(Simulator):
         scene_lib,
     ) -> None:
         """Initialize MuJoCo simulator shell."""
+        if (
+            config.domain_randomization is not None
+            and config.domain_randomization.body_mass is not None
+        ):
+            raise NotImplementedError(
+                "MuJoCo does not support body-mass domain randomization."
+            )
+
         assert device.type == "cpu", "MuJoCo simulator only supports CPU device"
         assert config.num_envs == 1, "MuJoCo simulator only supports num_envs=1"
         assert scene_lib.num_scenes() == 0, "MuJoCo simulator does not support scenes"
@@ -79,6 +88,7 @@ class MujocoSimulator(Simulator):
         self.data: Optional[mujoco.MjData] = None
         self.viewer = None
         self._viewer_initialized = False
+        self._keyboard_window = None
 
         # Cached control parameters
         self._kp = None  # [num_dofs] stiffness in common DOF order
@@ -606,9 +616,15 @@ class MujocoSimulator(Simulator):
             self.data,
             show_left_ui=False,
             show_right_ui=False,
-            key_callback=self._mujoco_key_callback,
+            key_callback=(
+                None
+                if self.config.use_separate_keyboard_window
+                else self._mujoco_key_callback
+            ),
         )
         self._viewer_initialized = True
+        if self.config.use_separate_keyboard_window:
+            self._keyboard_window = MujocoKeyboardWindow()
         # Ensure viewer is closed on exit to prevent hangs
         atexit.register(self._close_viewer)
 
@@ -619,7 +635,11 @@ class MujocoSimulator(Simulator):
         self.viewer.cam.trackbodyid = 1  # Track pelvis (first non-world body)
         self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
 
-        log.info("MuJoCo passive viewer launched (tracking body 1)")
+        log.info(
+            "MuJoCo passive viewer launched (tracking body 1); "
+            "separate keyboard window=%s",
+            self.config.use_separate_keyboard_window,
+        )
 
     @staticmethod
     def _marker_radius(size: str) -> float:
@@ -690,6 +710,9 @@ class MujocoSimulator(Simulator):
 
     def _close_viewer(self) -> None:
         """Close the viewer if it's still running."""
+        if self._keyboard_window is not None:
+            self._keyboard_window.close()
+            self._keyboard_window = None
         if self.viewer is not None and self._viewer_initialized:
             try:
                 self.viewer.close()
@@ -777,13 +800,19 @@ class MujocoSimulator(Simulator):
           - Explicit: We recompute PD torques at each substep (1kHz), matching
             RoboJuDo and real hardware PD loops.
 
-        For TORQUE/PROPORTIONAL modes, torques are applied once and held constant.
+        For TORQUE/PROPORTIONAL modes, torques are applied once and held constant
+        without latency randomization; with latency enabled, they are refreshed
+        at each substep to interpolate the action.
         """
         from protomotions.robot_configs.base import ControlType
 
+        self._poll_keyboard_events()
+        latency_enabled = self._max_action_latency_ms > 0.0
+
         # Apply control (base class calls _apply_simulator_pd_targets
         # or _apply_simulator_torques which write to data.ctrl)
-        self._apply_control()
+        if not latency_enabled:
+            self._apply_control()
 
         use_implicit_pd = getattr(self.config, "use_implicit_pd", True)
         use_explicit_substep_pd = (
@@ -794,12 +823,16 @@ class MujocoSimulator(Simulator):
         if use_explicit_substep_pd:
             # Explicit PD: recompute torques from current state at each substep
             for _ in range(self.decimation):
+                if latency_enabled:
+                    self._apply_control()
                 self._recompute_explicit_pd()
                 # print("Recomputed explicit PD torques")
                 mujoco.mj_step(self.model, self.data)
         else:
             # Implicit PD (position actuators) or TORQUE/PROPORTIONAL mode
             for _ in range(self.decimation):
+                if latency_enabled:
+                    self._apply_control()
                 mujoco.mj_step(self.model, self.data)
 
         self._step_count += 1
@@ -807,6 +840,13 @@ class MujocoSimulator(Simulator):
         # Periodic state monitoring
         if self._step_count % 100 == 1:
             self._print_state_debug()
+
+    def _poll_keyboard_events(self) -> None:
+        """Forward queued application keys before the next physics step."""
+        if self._keyboard_window is None:
+            return
+        for key, pressed in self._keyboard_window.drain_events():
+            self.user_interface.handle_key_event(key, pressed=pressed)
 
     def _print_state_debug(self) -> None:
         """Print state summary for debugging."""
@@ -1119,13 +1159,31 @@ class MujocoSimulator(Simulator):
         """
         if keycode < 0 or keycode > 127:
             return
-        self.user_interface.handle_key_event(chr(keycode), pressed=True)
+        # MuJoCo's callback is a discrete press notification; it does not
+        # deliver a matching release. Record it as an edge so repeated
+        # presses remain independent instead of leaving a key latched.
+        self.user_interface.handle_key_press(chr(keycode))
 
     def _write_viewport_to_file(self, file_name: str) -> None:
-        """Render current view to file."""
+        """Render the live viewer camera to a file.
+
+        ``Renderer.update_scene`` defaults to MuJoCo's free camera when no
+        camera is supplied. Reuse the passive viewer camera so recordings
+        match the view shown on screen.
+        """
         renderer = mujoco.Renderer(self.model, height=480, width=640)
-        renderer.update_scene(self.data)
-        pixels = renderer.render()
+        viewer = self.viewer if self._viewer_initialized else None
+        lock = (
+            viewer.lock()
+            if viewer is not None and hasattr(viewer, "lock")
+            else nullcontext()
+        )
+        with lock:
+            if viewer is not None:
+                renderer.update_scene(self.data, camera=viewer.cam)
+            else:
+                renderer.update_scene(self.data)
+            pixels = renderer.render()
 
         import matplotlib.pyplot as plt
 

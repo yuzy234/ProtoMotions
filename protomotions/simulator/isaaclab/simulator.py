@@ -532,6 +532,36 @@ class IsaacLabSimulator(Simulator):
                 wp.from_torch(all_env_ids, dtype=wp.int32),
             )
 
+        if self._domain_randomization is not None and "body_mass" in self._domain_randomization:
+            body_mass = self._domain_randomization["body_mass"]
+            body_names = [
+                self.robot_config.kinematic_info.body_names[body_idx]
+                for body_idx in body_mass["body_indices"]
+            ]
+            isaaclab_body_ids, _ = self._robot.find_bodies(
+                body_names, preserve_order=True
+            )
+            body_ids = torch.tensor(isaaclab_body_ids, dtype=torch.int32, device=self.device)
+            env_ids = torch.arange(
+                self.num_envs, dtype=torch.int32, device=self.device
+            )
+            num_buckets = body_mass["mass"].shape[0]
+            bucket_ids = torch.randint(
+                0, num_buckets, (self.num_envs,), device=self.device
+            )
+            masses = body_mass["mass"].to(self.device)[bucket_ids]
+            self._robot.set_masses_index(
+                masses=masses, body_ids=body_ids, env_ids=env_ids
+            )
+
+            default_mass = self._robot.data.default_mass.torch
+            default_inertia = self._robot.data.default_inertia.torch
+            ratios = masses / default_mass[env_ids[:, None], body_ids]
+            inertias = default_inertia[env_ids[:, None], body_ids] * ratios[..., None]
+            self._robot.set_inertias_index(
+                inertias=inertias, body_ids=body_ids, env_ids=env_ids
+            )
+
         self._apply_scene_object_properties_after_spawn(all_env_ids)
 
     def _apply_scene_object_properties_after_spawn(

@@ -685,6 +685,7 @@ class BaseEvaluator:
         plt.close(fig)
         print("Per-frame metrics plotted successfully")
 
+    @torch.no_grad()
     def simple_test_policy(self, collect_metrics: bool = False) -> None:
         """
         Simple evaluation loop for interactive testing.
