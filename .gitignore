@@ -14,6 +14,11 @@ exps/*
 wandb/*
 newton_source/*
 data/amass/*.pkl
+data/easymimic/assets/
+data/easymimic/*.ckpt
+data/easymimic/*.pt
+data/pretrained_models/motion_tracker/smpl-terrains/failed_motions/
+data/pretrained_models/motion_tracker/smpl-terrains/results/
 .claude/*
 !.claude/commands/
 .cursor/

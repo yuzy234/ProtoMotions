@@ -85,3 +85,71 @@ class MimicEvaluatorConfig(EvaluatorConfig):
             "max": 1.0,
         }
     )
+    eval_action_ema_alpha_min: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Minimum adaptive EMA alpha used for abrupt action changes.",
+            "min": 0.0,
+            "max": 1.0,
+        },
+    )
+    eval_action_ema_alpha_max: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Maximum adaptive EMA alpha used for small action changes.",
+            "min": 0.0,
+            "max": 1.0,
+        },
+    )
+    eval_action_ema_delta_scale: float = field(
+        default=0.03,
+        metadata={
+            "help": "Action RMS change scale controlling adaptive EMA decay.",
+            "min": 1.0e-6,
+        },
+    )
+    eval_action_ema_contact_alpha: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum EMA alpha for a leg while its foot is in measured contact. "
+                "None disables contact-aware leg filtering."
+            ),
+            "min": 0.0,
+            "max": 1.0,
+        },
+    )
+    eval_action_ema_contact_force_threshold: float = field(
+        default=5.0,
+        metadata={
+            "help": "Contact-force threshold in newtons for contact-aware EMA.",
+            "min": 0.0,
+        },
+    )
+    eval_pre_roll_steps: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Before a scored full-motion evaluation, hold reference time at "
+                "zero for this many policy/physics steps. This establishes contact "
+                "and previous-action history after a terrain-safe reset."
+            ),
+            "min": 0,
+        },
+    )
+    quality_checkpoint_score: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use success minus tracking/smoothness penalties for best-checkpoint "
+                "selection. Disabled by default to preserve upstream behavior."
+            )
+        },
+    )
+    quality_score_position_metric: str = "gt_error"
+    quality_score_success_weight: float = 10.0
+    quality_score_gt_weight: float = 1.0
+    quality_score_gr_weight: float = 0.25
+    quality_score_jerk_weight: float = 1.0e-4
+    quality_score_opening_jerk_weight: float = 2.0e-4
+    quality_score_action_delta_weight: float = 0.1

@@ -51,6 +51,7 @@ from protomotions.agents.evaluators.config import EvaluatorConfig
 from protomotions.agents.evaluators.aggregate_metrics import (
     SmoothnessAggregateMetric,
     ActionSmoothnessAggregateMetric,
+    OpeningJerkAggregateMetric,
 )
 
 log = logging.getLogger(__name__)
@@ -444,6 +445,14 @@ class BaseEvaluator:
             log.warning("Skipping action smoothness plugin: %s", e)
             return False
 
+    def _register_opening_jerk_plugin(self, duration_sec: float = 0.5) -> bool:
+        try:
+            self.metric_plugins.append(OpeningJerkAggregateMetric(self, duration_sec))
+            return True
+        except (ValueError, TypeError) as e:
+            log.warning("Skipping opening jerk plugin: %s", e)
+            return False
+
     def _compute_additional_metrics(
         self, metrics: Dict[str, MotionMetrics]
     ) -> Dict[str, float]:
@@ -614,7 +623,12 @@ class BaseEvaluator:
         plt.close(fig)
         print("Per-frame metrics plotted successfully")
 
-    def simple_test_policy(self, collect_metrics: bool = False) -> None:
+    def simple_test_policy(
+        self,
+        collect_metrics: bool = False,
+        loop_motion: bool = False,
+        motion_id: int = 0,
+    ) -> None:
         """
         Simple evaluation loop for interactive testing.
 
@@ -623,10 +637,33 @@ class BaseEvaluator:
 
         Args:
             collect_metrics: If True, collect and print average metrics on exit.
+            loop_motion: If True, replay a fixed motion from time zero after each clip end.
+            motion_id: Motion ID used by every environment in loop mode.
         """
         self.agent.eval()
         done_indices = None
         step = 0
+        completed_loops = 0
+        motion_manager = self.env.motion_manager
+        previous_clip_mode = None
+        if hasattr(motion_manager, "set_clip_mode"):
+            previous_clip_mode = motion_manager.clip_mode_enabled
+            # Interactive inference should replay the full motion; clip windows
+            # are a training-only reset policy.
+            motion_manager.set_clip_mode(False)
+
+        if loop_motion:
+            num_motions = self.env.motion_lib.num_motions()
+            if motion_id < 0 or motion_id >= num_motions:
+                raise ValueError(
+                    f"motion_id={motion_id} is outside [0, {num_motions - 1}]"
+                )
+            self.env.motion_manager.motion_ids.fill_(motion_id)
+            self.env.motion_manager.motion_times.zero_()
+            print(
+                f"Looping motion_id={motion_id} indefinitely from time zero "
+                f"({self.env.motion_lib.motion_num_frames[motion_id].item()} frames)."
+            )
 
         # Running averages for metrics
         metric_sums: Dict[str, float] = {}
@@ -635,12 +672,27 @@ class BaseEvaluator:
         print("Evaluating policy... (Ctrl+C to stop)")
         try:
             while True:
-                obs, _ = self.env.reset(done_indices)
+                if loop_motion and done_indices is not None and len(done_indices) > 0:
+                    self.env.motion_manager.motion_ids[done_indices] = motion_id
+                    self.env.motion_manager.motion_times[done_indices] = 0.0
+                    completed_loops += len(done_indices)
+                    print(f"Completed motion loops: {completed_loops}")
+
+                obs, _ = self.env.reset(
+                    done_indices,
+                    disable_motion_resample=loop_motion,
+                )
                 obs = self.agent.add_agent_info_to_obs(obs)
                 obs_td = self.agent.obs_dict_to_tensordict(obs)
 
                 model_outs = self.agent.model(obs_td)
                 action = model_outs.get("mean_action", model_outs["action"])
+                if "root_pos_residual_scaled" in model_outs and hasattr(
+                    self.env, "set_reference_root_residual"
+                ):
+                    self.env.set_reference_root_residual(
+                        model_outs["root_pos_residual_scaled"]
+                    )
 
                 obs, rewards, dones, terminated, extras = self.env.step(action)
                 obs = self.agent.add_agent_info_to_obs(obs)
@@ -662,3 +714,6 @@ class BaseEvaluator:
                 for k in sorted(metric_counts.keys()):
                     avg = metric_sums[k] / metric_counts[k]
                     print(f"  {k}: {avg:.4f}")
+        finally:
+            if previous_clip_mode is not None:
+                motion_manager.set_clip_mode(previous_clip_mode)

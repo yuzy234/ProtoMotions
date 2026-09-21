@@ -87,6 +87,8 @@ class MaskedMimicControlConfig(MimicControlConfig):
     # Probability that a pose is fully hidden (all bodies masked out)
     fully_hidden_pose_prob: float = 0.1
 
+    deterministic_full_body_conditioning: bool = False
+
 
 class MaskedMimicControl(MimicControl):
     """Control component for masked mimic tasks.
@@ -125,6 +127,16 @@ class MaskedMimicControl(MimicControl):
             dtype=torch.long,
         )
         self.num_conditionable_bodies = len(self.conditionable_body_ids)
+        if self.config.deterministic_full_body_conditioning:
+            names = [
+                self._all_body_names[body_id]
+                for body_id in self.conditionable_body_ids.tolist()
+            ]
+            print(
+                "MaskedMimic deterministic conditioning: "
+                f"bodies={names}, translation=True, rotation=True, "
+                f"future_steps={list(range(1, self.config.num_masked_future_steps + 1))}"
+            )
         
         # Initialize masked mimic state buffers
         self.masked_mimic_target_poses_masks = torch.zeros(
@@ -167,6 +179,11 @@ class MaskedMimicControl(MimicControl):
         
         if len(env_ids) == 0:
             return
+
+        if self.config.deterministic_full_body_conditioning:
+            self._set_deterministic_targets(env_ids)
+            self._initialized = True
+            return
         
         # Initialize time steps from current time
         new_times = self.env.motion_manager.motion_times[env_ids]
@@ -194,6 +211,13 @@ class MaskedMimicControl(MimicControl):
         
         if not self._initialized:
             return
+
+        if self.config.deterministic_full_body_conditioning:
+            env_ids = torch.arange(
+                self.env.num_envs, device=self.env.device, dtype=torch.long
+            )
+            self._set_deterministic_targets(env_ids)
+            return
         
         current_time = self.env.motion_manager.motion_times
         
@@ -204,6 +228,24 @@ class MaskedMimicControl(MimicControl):
         if len(resample_env_ids) > 0:
             self._shift_and_sample_time_steps(resample_env_ids)
             self._shift_and_sample_body_masks(resample_env_ids)
+
+    def _set_deterministic_targets(self, env_ids: Tensor):
+        """Expose all checkpoint-supported bodies at consecutive future steps."""
+        current_times = self.env.motion_manager.motion_times[env_ids]
+        motion_ids = self.env.motion_manager.motion_ids[env_ids]
+        motion_lengths = self.env.motion_lib.motion_lengths[motion_ids]
+        steps = torch.arange(
+            1,
+            self.config.num_masked_future_steps + 1,
+            device=self.env.device,
+            dtype=torch.float,
+        )
+        target_times = current_times.unsqueeze(-1) + steps.unsqueeze(0) * self.env.dt
+        self.target_times[env_ids] = torch.minimum(
+            target_times, motion_lengths.unsqueeze(-1)
+        )
+        self.masked_mimic_target_poses_masks[env_ids] = True
+        self.masked_mimic_target_bodies_masks[env_ids] = True
     
     def _shift_and_sample_time_steps(self, env_ids: Tensor):
         """Shift target time steps forward and sample a new future time step.

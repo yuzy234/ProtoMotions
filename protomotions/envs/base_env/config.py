@@ -63,6 +63,43 @@ class EnvConfig:
         default=0.05,
         metadata={"help": "Height offset for respawning relative to reference.", "min": 0.0}
     )
+    preserve_reference_world_position: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep the reference motion translation unchanged relative to its "
+                "scene during reset. External mesh collision tiling may still apply "
+                "the same world-space offset to both the scene and the motion."
+            )
+        },
+    )
+    safe_reference_reset: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Lift a reference-initialized character just enough that every "
+                "reference rigid-body center clears the terrain at reset. This "
+                "changes only the simulator reset state, not the reference target."
+            )
+        },
+    )
+    safe_reference_reset_margin: float = field(
+        default=0.02,
+        metadata={
+            "help": "Minimum terrain clearance in meters used by safe_reference_reset.",
+            "min": 0.0,
+        },
+    )
+    safe_reference_reset_blend_time: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Seconds over which a reward component may smoothly remove the "
+                "safe reset lift. Zero disables blending and preserves legacy behavior."
+            ),
+            "min": 0.0,
+        },
+    )
     ref_object_respawn_offset: float = field(
         default=0.0,
         metadata={"help": "Height offset for object respawning."}
@@ -108,4 +145,24 @@ class EnvConfig:
     action_config: Optional[Dict[str, Any]] = field(
         default=None,
         metadata={"help": "Single action processing config dict with 'fn' key. Use make_pd_action_config() helper."}
+    )
+    action_lowpass_alpha: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional causal EMA applied to policy actions inside the environment. "
+                "Putting the filter in the training loop avoids the train/deploy "
+                "mismatch caused by evaluation-only action smoothing."
+            )
+        },
+    )
+    action_lowpass_anneal_epochs: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "If positive, linearly anneal the in-loop action EMA from 1.0 "
+                "to action_lowpass_alpha over this many training epochs."
+            ),
+            "min": 0,
+        },
     )

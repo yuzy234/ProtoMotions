@@ -300,12 +300,15 @@ class Terrain:
 
         h = z_all_joints.gather(1, z_indices.unsqueeze(1)).squeeze(1)  # (batch_size,)
 
-        # Assert only moving up (non-negative height adjustment)
+        # Aligned external meshes nominally start at z=0, but float32 mesh
+        # export/transforms can leave a few 1e-5 m below zero. Treat that as
+        # numerical noise while still rejecting a genuinely misaligned scene.
+        tolerance = 1.0e-3
         assert torch.all(
-            h >= 0
-        ), f"Invalid height adjustment: expected all >= 0, got min={h.min():.4f}"
+            h >= -tolerance
+        ), f"Invalid height adjustment: expected all >= -{tolerance:g}, got min={h.min():.6f}"
 
-        return h
+        return h.clamp_min(0.0)
 
     def sample_valid_locations(self, num_envs, sample_flat=False):
         if sample_flat:

@@ -114,6 +114,31 @@ class BaseAgentConfig:
     training_early_termination: Optional[int] = field(
         default=None, metadata={"help": "Stop early at this step. None=disabled."}
     )
+    early_stop_min_epochs: Optional[int] = field(
+        default=None,
+        metadata={"help": "Do not metric-early-stop before this epoch."},
+    )
+    early_stop_patience_evals: Optional[int] = field(
+        default=None,
+        metadata={"help": "Stop after this many eligible evaluations without improvement."},
+    )
+    early_stop_min_delta: float = field(
+        default=0.0,
+        metadata={"help": "Minimum evaluated-score increase counted as improvement."},
+    )
+    early_stop_min_success_rate: float = field(
+        default=0.0,
+        metadata={"help": "Only count patience after evaluation reaches this success rate."},
+    )
+    early_stop_force_after_epochs: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "After this epoch, allow plateau stopping even below the success "
+                "threshold. None keeps requiring success."
+            )
+        },
+    )
 
     # Checkpoint saving configuration
     save_epoch_checkpoint_every: Optional[int] = field(

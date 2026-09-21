@@ -194,6 +194,33 @@ def create_parser():
         help="Path to motion file for training",
     )
     parser.add_argument(
+        "--smpl-shape-from-motion",
+        action="store_true",
+        default=False,
+        help=(
+            "For a fixed SMPL motion, use its motion_betas/motion_asset_files "
+            "to configure the simulator humanoid before training."
+        ),
+    )
+    parser.add_argument(
+        "--motion-id",
+        type=int,
+        default=0,
+        help="Motion ID used with --smpl-shape-from-motion.",
+    )
+    parser.add_argument(
+        "--shape-asset-dir",
+        type=str,
+        default="data/easymimic/assets/mjcf",
+        help="Fallback output directory for generated per-shape SMPL MJCF files.",
+    )
+    parser.add_argument(
+        "--smpl-data-dir",
+        type=str,
+        default=None,
+        help="SMPL PKL directory used only when a per-motion MJCF must be generated.",
+    )
+    parser.add_argument(
         "--experiment-path",
         type=str,
         required=True,
@@ -731,6 +758,25 @@ def main():
     # 5. Create Environment and Agent
     # ===================================================================
     # Note: Configs are already loaded/built in section 2 based on mode
+    if args.smpl_shape_from_motion:
+        from protomotions.utils.smpl_shape import configure_robot_from_motion_shape
+
+        selected_asset = configure_robot_from_motion_shape(
+            robot_config=robot_config,
+            motion_file=motion_lib_config.motion_file,
+            motion_id=args.motion_id,
+            shape_asset_dir=args.shape_asset_dir,
+            smpl_data_dir=args.smpl_data_dir,
+            # Training should use the motion-specific MJCF dynamics. Inference
+            # separately preserves the checkpoint's resolved control values.
+            preserve_control_info=False,
+        )
+        log.info(
+            "Using motion-specific SMPL asset for training (motion_id=%d): %s",
+            args.motion_id,
+            selected_asset,
+        )
+
     fabric.call(
         "on_app_start",
         fabric,

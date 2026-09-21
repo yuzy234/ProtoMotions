@@ -145,6 +145,48 @@ class TerrainConfig:
         default=None,
         metadata={"help": "Path to save/load terrain file."}
     )
+    mesh_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional external triangle mesh terrain. The mesh is kept in world coordinates."
+        },
+    )
+    mesh_height_rasterizer: str = field(
+        default="triangle_surface_layers_v1",
+        metadata={
+            "help": (
+                "Height observation for external meshes. triangle_surface_layers_v1 "
+                "selects the nearest surface below each query and is retessellation-invariant; "
+                "legacy_vertex_griddata only reproduces old checkpoints."
+            )
+        },
+    )
+    mesh_support_ceiling_tolerance: float = field(
+        default=0.05,
+        metadata={
+            "help": "A surface up to this distance above a query may count as its support.",
+            "min": 0.0,
+        },
+    )
+    mesh_collision_tiles: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of spatially separated copies used for an external mesh. "
+                "Parallel environments are distributed over these copies to avoid "
+                "GPU PhysX broadphase overload while preserving scene-relative poses. "
+                "Zero automatically keeps at most 16 environments on each copy."
+            ),
+            "min": 0,
+        },
+    )
+    mesh_collision_tile_margin: float = field(
+        default=1.0,
+        metadata={
+            "help": "Empty XY margin in meters between external-mesh collision copies.",
+            "min": 0.0,
+        },
+    )
     load_terrain: bool = field(
         default=False,
         metadata={"help": "Load terrain from file instead of generating."}

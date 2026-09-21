@@ -80,3 +80,39 @@ class MimicMotionManagerConfig(MotionManagerConfig):
         default=True,
         metadata={"help": "Whether to resample motion on environment reset."}
     )
+
+
+@dataclass
+class OverlappingClipMotionManagerConfig(MimicMotionManagerConfig):
+    """Single-motion curriculum over overlapping fixed-duration tracking clips."""
+
+    _target_: str = (
+        "protomotions.envs.motion_manager.overlapping_clip_motion_manager."
+        "OverlappingClipMotionManager"
+    )
+    clip_motion_id: int = field(default=0)
+    clip_duration: float = field(default=2.0, metadata={"help": "Clip duration in seconds."})
+    clip_stride: float = field(default=1.0, metadata={"help": "Training-window stride in seconds."})
+    failure_sampling_mix: float = field(
+        default=0.8,
+        metadata={"help": "Probability mass from failure-weighted rather than uniform sampling."},
+    )
+    max_failure_weight_ratio: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional upper ratio between the hardest and easiest clip "
+                "curriculum weights. None preserves pure failure-rate sampling."
+            )
+        },
+    )
+    full_motion_sampling_probability: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Probability of sampling a start-to-finish episode in addition "
+                "to overlapping short windows. This exposes accumulated drift "
+                "that cannot be observed in independently reset clips."
+            )
+        },
+    )

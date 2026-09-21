@@ -26,6 +26,7 @@ Key Classes:
 """
 
 from typing import Dict
+import torch
 from protomotions.agents.evaluators.metrics import MotionMetrics
 from protomotions.agents.evaluators.smoothness_calculator import SmoothnessCalculator
 
@@ -96,6 +97,36 @@ class SmoothnessAggregateMetric(AggregateMetric):
             result[f"eval/{k}"] = v
 
         return result
+
+
+class OpeningJerkAggregateMetric(AggregateMetric):
+    """Direct Cartesian jerk over the first part of each evaluated motion."""
+
+    def __init__(self, evaluator, duration_sec: float = 0.5):
+        self.dt = evaluator.env.dt
+        self.duration_sec = duration_sec
+        self.num_bodies = evaluator.env.robot_config.kinematic_info.num_bodies
+
+    def compute(self, metrics: Dict[str, MotionMetrics]) -> Dict[str, float]:
+        if "rigid_body_pos" not in metrics:
+            return {}
+        storage = metrics["rigid_body_pos"]
+        values = []
+        desired_frames = max(4, int(round(self.duration_sec / self.dt)))
+        for motion_id in range(storage.data.shape[0]):
+            count = min(int(storage.frame_counts[motion_id].item()), desired_frames)
+            if count < 4:
+                continue
+            pos = storage.data[motion_id, :count].reshape(
+                count, self.num_bodies, 3
+            )
+            jerk = torch.diff(pos, n=3, dim=0) / (self.dt**3)
+            values.append(torch.sqrt(torch.mean(torch.sum(jerk.square(), dim=-1))))
+        if not values:
+            return {}
+        value = torch.stack(values).mean().item()
+        print(f"Opening jerk metric: value={value}")
+        return {"eval/opening_body_jerk_rms_m_s3": value}
 
 
 class ActionSmoothnessAggregateMetric(AggregateMetric):

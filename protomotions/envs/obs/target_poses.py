@@ -19,13 +19,140 @@ Provides functions for building target pose observations from reference motions,
 used for motion tracking and imitation learning.
 """
 
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
 
 from protomotions.utils import rotations
 from protomotions.envs.obs.utils import select_step_indices
+
+
+def build_contact_conditioned_takeoff_demand(
+    current_ref_body_vel: Tensor,
+    future_ref_root_vel: Tensor,
+    current_ref_contacts: Tensor,
+    future_reference_reliability: Tensor,
+    support_body_ids: Optional[List[int]] = None,
+    vertical_speed_scale: float = 3.0,
+    horizon_weights: Optional[List[float]] = None,
+) -> Tensor:
+    """Measure a reliable, near-future launch demand while support still exists.
+
+    The scalar is intended to condition *training exploration*, not the
+    deterministic action mean.  A demand is emitted only when a designated
+    reference support body is currently in contact and a reliable near-future
+    root command requires both upward motion and an increase in vertical
+    velocity.  Optional horizon weights prevent a distant jump in a long
+    command window from injecting noise throughout an otherwise easy prefix.
+
+    Returns:
+        Tensor of shape ``[num_envs, 1]`` in ``[0, 1]``.
+    """
+    if current_ref_body_vel.ndim != 3 or current_ref_body_vel.shape[-1] != 3:
+        raise ValueError("current_ref_body_vel must have shape [envs, bodies, 3]")
+    if future_ref_root_vel.ndim != 3 or future_ref_root_vel.shape[-1] != 3:
+        raise ValueError(
+            "future_ref_root_vel must have shape [envs, future_steps, 3]"
+        )
+    if current_ref_contacts.ndim != 2:
+        raise ValueError("current_ref_contacts must have shape [envs, bodies]")
+    if future_reference_reliability.ndim != 2:
+        raise ValueError(
+            "future_reference_reliability must have shape [envs, future_steps]"
+        )
+    if current_ref_body_vel.shape[0] != future_ref_root_vel.shape[0]:
+        raise ValueError("current and future root velocity batches must match")
+    if current_ref_contacts.shape[0] != future_ref_root_vel.shape[0]:
+        raise ValueError("contact and velocity batches must match")
+    if future_reference_reliability.shape != future_ref_root_vel.shape[:2]:
+        raise ValueError(
+            "future_reference_reliability must match the future velocity horizon"
+        )
+    if vertical_speed_scale <= 0.0:
+        raise ValueError("vertical_speed_scale must be positive")
+
+    if support_body_ids is None:
+        support_body_ids = [3, 4, 7, 8]
+    if not support_body_ids:
+        raise ValueError("support_body_ids cannot be empty")
+    if (
+        min(support_body_ids) < 0
+        or max(support_body_ids) >= current_ref_contacts.shape[1]
+    ):
+        raise ValueError("support_body_ids contains an out-of-range body index")
+
+    support = current_ref_contacts[:, support_body_ids].to(
+        dtype=future_ref_root_vel.dtype
+    ).amax(dim=-1)
+    current_vertical = current_ref_body_vel[:, :1, 2]
+    future_vertical = future_ref_root_vel[..., 2]
+    upward_speed = torch.relu(future_vertical)
+    upward_speed_gain = torch.relu(future_vertical - current_vertical)
+    # Both conditions are needed: recovering from downward velocity without a
+    # future upward command is not a launch, and high constant upward velocity
+    # no longer needs additional support-phase exploration.
+    launch_speed = torch.minimum(upward_speed, upward_speed_gain)
+    trusted_launch_speed = (
+        launch_speed * future_reference_reliability.clamp(0.0, 1.0)
+    )
+
+    if horizon_weights is not None:
+        if len(horizon_weights) != future_ref_root_vel.shape[1]:
+            raise ValueError(
+                "horizon_weights must contain one value per future velocity step"
+            )
+        weights = future_ref_root_vel.new_tensor(horizon_weights)
+        if bool(torch.any(weights < 0.0)):
+            raise ValueError("horizon_weights must be non-negative")
+        trusted_launch_speed = trusted_launch_speed * weights.unsqueeze(0)
+
+    demand = trusted_launch_speed.amax(dim=1) / float(vertical_speed_scale)
+    return (support * demand.clamp(0.0, 1.0)).unsqueeze(-1)
+
+
+def build_reference_reliability(
+    mimic_ref_vel: Tensor,
+    mimic_ref_ang_vel: Tensor,
+    linear_speed_soft: float = 4.0,
+    angular_speed_soft: float = 6.0,
+    linear_change_scale: float = 2.0,
+    angular_change_scale: float = 4.0,
+    min_reliability: float = 0.1,
+) -> Tensor:
+    """Estimate a causal confidence gate from a short future command window.
+
+    Video-derived references occasionally contain one-frame velocity spikes.
+    Absolute speed alone is not enough to identify them because fast limbs can
+    be valid, so the score combines soft speed limits with disagreement among
+    the future velocity samples.  The output is deliberately a single scalar
+    per environment: it gates only the new temporal side path and never erases
+    the pretrained tracker's original one-step command.
+    """
+    linear_speed = torch.linalg.vector_norm(mimic_ref_vel, dim=-1)
+    angular_speed = torch.linalg.vector_norm(mimic_ref_ang_vel, dim=-1)
+    speed_penalty = (
+        torch.relu(linear_speed - linear_speed_soft) / linear_speed_soft
+        + torch.relu(angular_speed - angular_speed_soft) / angular_speed_soft
+    )
+
+    if mimic_ref_vel.shape[1] > 1:
+        linear_change = torch.linalg.vector_norm(
+            mimic_ref_vel[:, 1:] - mimic_ref_vel[:, :-1], dim=-1
+        )
+        angular_change = torch.linalg.vector_norm(
+            mimic_ref_ang_vel[:, 1:] - mimic_ref_ang_vel[:, :-1], dim=-1
+        )
+        change_penalty = (
+            linear_change / linear_change_scale
+            + angular_change / angular_change_scale
+        ).mean(dim=(1, 2))
+    else:
+        change_penalty = speed_penalty.new_zeros(speed_penalty.shape[0])
+
+    penalty = speed_penalty.mean(dim=(1, 2)) + change_penalty
+    reliability = torch.exp(-penalty).clamp(min=min_reliability, max=1.0)
+    return reliability.unsqueeze(-1)
 
 
 def build_max_coords_target_poses_future_rel(
@@ -346,6 +473,211 @@ def build_max_coords_target_poses(
         )
 
     return obs.view(num_envs, -1)
+
+
+def build_reliability_gated_max_coords_target_poses_future_rel(
+    current_state_body_pos: Tensor,
+    current_state_body_rot: Tensor,
+    mimic_ref_pos: Tensor,
+    mimic_ref_rot: Tensor,
+    future_reference_reliability: Tensor,
+    w_last: bool,
+    future_steps: Union[int, List[int]] = None,
+    minimum_global_weight: float = 0.0,
+    gravity_axis_only: bool = False,
+    include_reliability: bool = True,
+    include_trusted_vertical_anchors: bool = False,
+    mimic_ref_vel: Optional[Tensor] = None,
+    include_trusted_vertical_velocity: bool = False,
+):
+    """Build temporal articulation context without trusting noisy root jumps.
+
+    The ordinary future-relative context exposes every observed shared root
+    increment to the residual policy.  That silently bypasses reliability
+    gating in the one-step command: a missing support can therefore command a
+    spurious jump several frames in advance.  Here each root increment is
+    accumulated with its own future confidence, while the same translation is
+    applied to every body so root-relative articulation remains exact.
+
+    At unit reliability this is exactly
+    :func:`build_max_coords_target_poses_future_rel` (plus the optional
+    confidence features).  With low vertical confidence, XY motion and all
+    body-relative pose changes are preserved but the untrusted Z increment is
+    withheld for contact dynamics to resolve.
+    """
+    if not 0.0 <= minimum_global_weight <= 1.0:
+        raise ValueError("minimum_global_weight must lie in [0, 1]")
+    if future_reference_reliability.ndim != 2:
+        raise ValueError(
+            "future_reference_reliability must have shape [envs, future_steps]"
+        )
+    if future_reference_reliability.shape[:2] != mimic_ref_pos.shape[:2]:
+        raise ValueError(
+            "future_reference_reliability must match the reference horizon"
+        )
+    if include_trusted_vertical_velocity:
+        if mimic_ref_vel is None:
+            raise ValueError(
+                "mimic_ref_vel is required when "
+                "include_trusted_vertical_velocity=True"
+            )
+        if mimic_ref_vel.shape[:2] != mimic_ref_pos.shape[:2]:
+            raise ValueError("mimic_ref_vel must match the reference horizon")
+
+    if future_steps is not None:
+        mimic_ref_pos = select_step_indices(mimic_ref_pos, future_steps)
+        mimic_ref_rot = select_step_indices(mimic_ref_rot, future_steps)
+        future_reference_reliability = select_step_indices(
+            future_reference_reliability.unsqueeze(-1), future_steps
+        ).squeeze(-1)
+        if mimic_ref_vel is not None:
+            mimic_ref_vel = select_step_indices(mimic_ref_vel, future_steps)
+
+    reliability = future_reference_reliability.clamp(0.0, 1.0)
+    global_weight = minimum_global_weight + (
+        1.0 - minimum_global_weight
+    ) * reliability
+    if gravity_axis_only:
+        axis_weight = torch.ones(
+            (*global_weight.shape, 3),
+            dtype=global_weight.dtype,
+            device=global_weight.device,
+        )
+        axis_weight[..., 2] = global_weight
+    else:
+        axis_weight = global_weight.unsqueeze(-1).expand(-1, -1, 3)
+
+    reference_root = mimic_ref_pos[:, :, :1, :]
+    previous_root = torch.cat(
+        (current_state_body_pos[:, None, :1, :], reference_root[:, :-1]),
+        dim=1,
+    )
+    root_increments = reference_root - previous_root
+    gated_root = current_state_body_pos[:, None, :1, :] + torch.cumsum(
+        root_increments * axis_weight[:, :, None, :], dim=1
+    )
+    gated_ref_pos = mimic_ref_pos + (gated_root - reference_root)
+
+    context = build_max_coords_target_poses_future_rel(
+        current_state_body_pos=current_state_body_pos,
+        current_state_body_rot=current_state_body_rot,
+        mimic_ref_pos=gated_ref_pos,
+        mimic_ref_rot=mimic_ref_rot,
+        w_last=w_last,
+    )
+    side_features = []
+    if include_reliability:
+        side_features.append(reliability)
+    if include_trusted_vertical_anchors:
+        # Unknown intermediate samples must not command their observed height,
+        # but a later high-confidence support is useful as a planning anchor.
+        # Expose that endpoint displacement separately from the smooth local
+        # command, weighted by confidence so no noisy absolute Z leaks back in.
+        trusted_vertical_anchor = reliability * (
+            reference_root[:, :, 0, 2]
+            - current_state_body_pos[:, None, 0, 2]
+        )
+        side_features.append(trusted_vertical_anchor)
+    if include_trusted_vertical_velocity:
+        # A future height alone does not tell the policy whether an upcoming
+        # frame is a support, takeoff, or landing state.  The trusted world-Z
+        # root velocity supplies that phase information early enough to prepare
+        # an impulse.  It is yaw invariant, confidence gated, and remains a
+        # command observation only: no action filtering or simulator force is
+        # applied at deployment.
+        trusted_vertical_velocity = reliability * mimic_ref_vel[:, :, 0, 2]
+        side_features.append(trusted_vertical_velocity)
+    if side_features:
+        context = torch.cat((context, *side_features), dim=-1)
+    return context
+
+
+def build_reliability_gated_max_coords_target_poses(
+    current_state_body_pos: Tensor,
+    current_state_body_rot: Tensor,
+    current_state_body_vel: Tensor,
+    current_state_body_ang_vel: Tensor,
+    mimic_ref_pos: Tensor,
+    mimic_ref_rot: Tensor,
+    mimic_ref_vel: Tensor,
+    mimic_ref_ang_vel: Tensor,
+    reference_reliability: Tensor,
+    with_velocities: bool,
+    w_last: bool,
+    future_steps: Union[int, List[int]] = None,
+    with_relative: bool = True,
+    minimum_global_weight: float = 0.0,
+    gravity_axis_only: bool = False,
+):
+    """Build the pretrained target encoding with confidence-gated root motion.
+
+    A noisy global trajectory should not erase the observed articulation.  We
+    decompose reference positions and linear velocities into a shared root
+    component and root-relative body components.  Reliability attenuates only
+    the shared translation and velocity before delegating to the exact
+    pretrained max-coordinate encoder.  Body-relative geometry, orientations,
+    angular velocities, feature order, and feature dimensionality are kept.
+
+    At reliability one this is exactly :func:`build_max_coords_target_poses`.
+    At reliability zero, the commanded root position and velocity coincide
+    with the current simulated root.  Contacts and gravity can then determine
+    global placement while articulation remains fully specified.
+    """
+    if not 0.0 <= minimum_global_weight <= 1.0:
+        raise ValueError("minimum_global_weight must lie in [0, 1]")
+    if reference_reliability.shape[0] != current_state_body_pos.shape[0]:
+        raise ValueError("reference_reliability must have one value per environment")
+
+    reliability = reference_reliability.reshape(
+        reference_reliability.shape[0], -1
+    )
+    if reliability.shape[1] != 1:
+        raise ValueError("reference_reliability must be scalar per environment")
+    global_weight = minimum_global_weight + (
+        1.0 - minimum_global_weight
+    ) * reliability.clamp(0.0, 1.0)
+    if gravity_axis_only:
+        # Scene contact constrains the gravity-normal gauge most directly.
+        # Preserve the observed horizontal trajectory while allowing physics
+        # to reject floating/penetrating vertical root placement.
+        axis_weight = torch.ones(
+            (global_weight.shape[0], 3),
+            dtype=global_weight.dtype,
+            device=global_weight.device,
+        )
+        axis_weight[:, 2] = global_weight[:, 0]
+        global_weight = axis_weight[:, None, None, :]
+    else:
+        global_weight = global_weight[:, None, None, :]
+
+    current_root_pos = current_state_body_pos[:, None, :1, :]
+    reference_root_pos = mimic_ref_pos[:, :, :1, :]
+    gated_root_pos = current_root_pos + global_weight * (
+        reference_root_pos - current_root_pos
+    )
+    gated_ref_pos = mimic_ref_pos + (gated_root_pos - reference_root_pos)
+
+    current_root_vel = current_state_body_vel[:, None, :1, :]
+    reference_root_vel = mimic_ref_vel[:, :, :1, :]
+    gated_root_vel = current_root_vel + global_weight * (
+        reference_root_vel - current_root_vel
+    )
+    gated_ref_vel = mimic_ref_vel + (gated_root_vel - reference_root_vel)
+
+    return build_max_coords_target_poses(
+        current_state_body_pos=current_state_body_pos,
+        current_state_body_rot=current_state_body_rot,
+        current_state_body_vel=current_state_body_vel,
+        current_state_body_ang_vel=current_state_body_ang_vel,
+        mimic_ref_pos=gated_ref_pos,
+        mimic_ref_rot=mimic_ref_rot,
+        mimic_ref_vel=gated_ref_vel,
+        mimic_ref_ang_vel=mimic_ref_ang_vel,
+        with_velocities=with_velocities,
+        w_last=w_last,
+        future_steps=future_steps,
+        with_relative=with_relative,
+    )
 
 
 # Context mapping for ONNX export

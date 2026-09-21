@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 The ProtoMotions Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Adapt the frozen SMPL terrain tracker in its 1024D penultimate latent."""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+from protomotions.agents.common.config import MLPWithConcatConfig, MLPLayerConfig
+from protomotions.agents.mimic.latent_residual_tracker_actor import (
+    LatentResidualTrackerActorConfig,
+)
+from protomotions.agents.mimic.root_residual_ppo_model import (
+    PretrainedCriticPPOModelConfig,
+)
+
+
+_BASE_EXPERIMENT_PATH = Path(__file__).resolve().parent / "experiment_config.py"
+_SPEC = importlib.util.spec_from_file_location(
+    "smpl_terrains_base_experiment_for_latent_residual", _BASE_EXPERIMENT_PATH
+)
+base_experiment = importlib.util.module_from_spec(_SPEC)
+assert _SPEC.loader is not None
+_SPEC.loader.exec_module(base_experiment)
+
+
+terrain_config = base_experiment.terrain_config
+scene_lib_config = base_experiment.scene_lib_config
+motion_lib_config = base_experiment.motion_lib_config
+configure_robot_and_simulator = base_experiment.configure_robot_and_simulator
+apply_inference_overrides = base_experiment.apply_inference_overrides
+
+
+def env_config(*args, **kwargs):
+    cfg = base_experiment.env_config(*args, **kwargs)
+    cfg.preserve_reference_world_position = True
+    cfg.safe_reference_reset = True
+    cfg.safe_reference_reset_margin = 0.02
+
+    from protomotions.envs.motion_manager.config import (
+        OverlappingClipMotionManagerConfig,
+    )
+
+    cfg.motion_manager = OverlappingClipMotionManagerConfig(
+        clip_motion_id=0,
+        clip_duration=2.0,
+        clip_stride=1.0,
+        failure_sampling_mix=0.8,
+        init_start_prob=0.0,
+        resample_on_reset=True,
+    )
+    return cfg
+
+
+def agent_config(robot_config, env_config, args):
+    cfg = base_experiment.agent_config(robot_config, env_config, args)
+    frozen_actor = cfg.model.actor
+    base_model_cfg = cfg.model
+    obs_keys = list(frozen_actor.in_keys)
+    checkpoint_path = Path(__file__).resolve().parent / "last.ckpt"
+
+    cfg.model = PretrainedCriticPPOModelConfig(
+        in_keys=base_model_cfg.in_keys,
+        out_keys=base_model_cfg.out_keys,
+        actor=base_model_cfg.actor,
+        critic=base_model_cfg.critic,
+        actor_optimizer=base_model_cfg.actor_optimizer,
+        critic_optimizer=base_model_cfg.critic_optimizer,
+        critic_checkpoint=str(checkpoint_path),
+    )
+
+    latent_dim = 1024
+    residual_model = MLPWithConcatConfig(
+        in_keys=["base_actor_latent"],
+        out_keys=["latent_residual_raw"],
+        normalize_obs=True,
+        norm_clamp_value=5,
+        num_out=latent_dim,
+        layers=[
+            MLPLayerConfig(units=512, activation="relu"),
+            MLPLayerConfig(units=512, activation="relu"),
+            MLPLayerConfig(units=512, activation="relu"),
+        ],
+    )
+
+    cfg.model.actor = LatentResidualTrackerActorConfig(
+        mu_key=frozen_actor.mu_key,
+        in_keys=obs_keys,
+        out_keys=frozen_actor.out_keys + ["raw_mean_action"],
+        num_out=frozen_actor.num_out,
+        # exp(-1.29056) * 0.2 == exp(-2.9): identical initial action
+        # exploration to the pretrained tracker.
+        actor_logstd=-1.2905620875658997,
+        learnable_std=True,
+        frozen_actor=frozen_actor,
+        residual_model=residual_model,
+        frozen_actor_checkpoint=str(checkpoint_path),
+        base_latent_key="base_actor_latent",
+        residual_key="latent_residual_raw",
+        raw_mean_key="raw_mean_action",
+        latent_residual_scale=0.25,
+        residual_noise_scale=0.2,
+        min_logstd=-3.0,
+        max_logstd=-0.5,
+    )
+    cfg.model.out_keys = list(dict.fromkeys(cfg.model.out_keys + ["raw_mean_action"]))
+
+    cfg.model.actor_optimizer.lr = 1e-4
+    cfg.model.critic_optimizer.lr = 1e-5
+    return cfg

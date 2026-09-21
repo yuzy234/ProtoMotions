@@ -189,6 +189,15 @@ class BaseEnv:
         self.respawn_root_offset = torch.zeros(
             self.num_envs, 3, dtype=torch.float, device=self.device
         )
+        self.reference_root_residual = torch.zeros(
+            self.num_envs, 3, dtype=torch.float, device=self.device
+        )
+        self.reference_root_velocity_residual = torch.zeros(
+            self.num_envs, 3, dtype=torch.float, device=self.device
+        )
+        self.safe_reference_reset_lift = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
+        )
 
         # Contact force tracking for impact penalty rewards
         # Initialized properly after simulator init when we know num_bodies
@@ -201,6 +210,24 @@ class BaseEnv:
         )
         self._current_processed_action = torch.zeros(
             self.num_envs, num_actions, dtype=torch.float, device=self.device
+        )
+        self._filtered_policy_action = torch.zeros(
+            self.num_envs, num_actions, dtype=torch.float, device=self.device
+        )
+        self._filtered_policy_action_valid = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+
+        action_lowpass_alpha = self.config.action_lowpass_alpha
+        if action_lowpass_alpha is not None and not 0.0 < action_lowpass_alpha <= 1.0:
+            raise ValueError("action_lowpass_alpha must lie in (0, 1].")
+        if self.config.action_lowpass_anneal_epochs < 0:
+            raise ValueError("action_lowpass_anneal_epochs must be non-negative.")
+        self._action_lowpass_alpha = (
+            1.0
+            if action_lowpass_alpha is not None
+            and self.config.action_lowpass_anneal_epochs > 0
+            else action_lowpass_alpha
         )
 
         # Global context cache - built once per step in post_physics_step
@@ -216,6 +243,37 @@ class BaseEnv:
         )
 
         self.initialize_simulator()
+
+    def set_reference_root_residual(
+        self,
+        residual: Tensor,
+        velocity_residual: Optional[Tensor] = None,
+    ) -> None:
+        """Set per-env reference root translation residual for the next env step.
+
+        This is an optional hook used by policies that explicitly learn a root
+        correction for motion tracking.  Standard policies never call it, so the
+        residual remains zero and behavior is unchanged.
+        """
+
+        if residual.shape != self.reference_root_residual.shape:
+            raise ValueError(
+                "reference root residual must have shape "
+                f"{tuple(self.reference_root_residual.shape)}, got {tuple(residual.shape)}"
+            )
+        self.reference_root_residual.copy_(residual.detach())
+        if velocity_residual is None:
+            self.reference_root_velocity_residual.zero_()
+        else:
+            if velocity_residual.shape != self.reference_root_velocity_residual.shape:
+                raise ValueError(
+                    "reference root velocity residual must have shape "
+                    f"{tuple(self.reference_root_velocity_residual.shape)}, "
+                    f"got {tuple(velocity_residual.shape)}"
+                )
+            self.reference_root_velocity_residual.copy_(
+                velocity_residual.detach()
+            )
 
     def initialize_simulator(self):
         """Initialize simulator with task-specific visualization markers.
@@ -500,6 +558,16 @@ class BaseEnv:
 
         respawn_offset = torch.zeros((len(env_ids), 3), device=self.device)
 
+        if self.config.preserve_reference_world_position and ref_state is not None:
+            # Preserve the motion inside its reconstructed scene, not at one
+            # shared global XY position.  External mesh terrains may expose
+            # balanced per-environment scene copies for PhysX broadphase.
+            get_env_offsets = getattr(self.terrain, "get_env_offsets", None)
+            if get_env_offsets is not None:
+                respawn_offset.copy_(get_env_offsets(env_ids))
+            self.respawn_root_offset[env_ids] = respawn_offset
+            return respawn_offset
+
         # Get boolean masks for scene vs non-scene envs
         scene_mask, non_scene_mask = self.get_scene_non_scene_mask(env_ids)
 
@@ -536,6 +604,7 @@ class BaseEnv:
         respawn_offset[:, 2] += self.config.ref_respawn_offset
 
         self.respawn_root_offset[env_ids] = respawn_offset
+        return respawn_offset
 
     def align_motion_with_humanoid(self, env_ids, root_pos):
         """Compute XY offset between humanoid spawn position and reference motion data.
@@ -579,6 +648,10 @@ class BaseEnv:
             env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
 
         new_offset = torch.zeros_like(target_pos)
+        if self.config.preserve_reference_world_position:
+            new_offset += self.respawn_root_offset[env_ids, None, :]
+            return new_offset
+
         new_offset[:, :, :2] = self.respawn_root_offset[env_ids, :2][:, None, :]
 
         if not self.skip_height_correction:
@@ -659,7 +732,25 @@ class BaseEnv:
         self._current_context = None
         self._current_noisy_obs = None
 
-        # Store current actions
+        # Keep the deployment action filter inside the environment so PPO sees
+        # the same actuator command dynamics during adaptation and evaluation.
+        # The first action after a reset is passed through unchanged; filtering
+        # it against an artificial zero would introduce a reset-only transient.
+        action_lowpass_alpha = self._action_lowpass_alpha
+        if action_lowpass_alpha is not None:
+            filtered = (
+                float(action_lowpass_alpha) * action
+                + (1.0 - float(action_lowpass_alpha))
+                * self._filtered_policy_action
+            )
+            action = torch.where(
+                self._filtered_policy_action_valid.unsqueeze(-1), filtered, action
+            )
+            self._filtered_policy_action.copy_(action.detach())
+            self._filtered_policy_action_valid.fill_(True)
+
+        # Store the action actually presented to the actuator model. This also
+        # makes `previous_actions` identical between training and deployment.
         self._current_raw_action[:] = action
 
         # Process action
@@ -683,7 +774,11 @@ class BaseEnv:
         Args:
             current_epoch: Current epoch number
         """
-        pass
+        target_alpha = self.config.action_lowpass_alpha
+        anneal_epochs = self.config.action_lowpass_anneal_epochs
+        if target_alpha is not None and anneal_epochs > 0:
+            progress = min(max(float(current_epoch + 1) / anneal_epochs, 0.0), 1.0)
+            self._action_lowpass_alpha = 1.0 + progress * (target_alpha - 1.0)
 
     def post_physics_step(self):
         """Update environment state after physics simulation step.
@@ -924,6 +1019,7 @@ class BaseEnv:
             body_contacts=body_contacts,
             current_contact_force_magnitudes=current_contact_force_magnitudes,
             prev_contact_force_magnitudes=self.prev_contact_force_magnitudes,
+            episode_progress=self.progress_buf,
             dt=self.dt,
             # Contact tracking
             contact_body_ids=self.contact_body_ids,
@@ -1019,6 +1115,12 @@ class BaseEnv:
 
         ref_state = self.motion_lib.get_motion_state(motion_ids, motion_times)
         new_states = ResetState.from_robot_state(ref_state)
+        # A physics-guided reference search can assign a different root
+        # translation to every parallel environment.  Apply the same residual
+        # to the simulator reset and to subsequent mimic targets, otherwise the
+        # first action would have to absorb an artificial reset discontinuity.
+        new_states.root_pos += self.reference_root_residual[env_ids]
+        new_states.root_vel += self.reference_root_velocity_residual[env_ids]
 
         new_object_states = self.scene_lib.get_scene_pose(
             env_ids, motion_times, respawn_offset=self.config.ref_object_respawn_offset
@@ -1032,16 +1134,42 @@ class BaseEnv:
             sample_flat=sample_flat,
         )
 
-        return self.move_reset_robot_obj_states_to_respawn_position(
+        new_states, new_object_states = self.move_reset_robot_obj_states_to_respawn_position(
             env_ids, new_states, new_object_states
         )
 
+        # CRISP-style terrain-aware reference reset.  A reference pose may have
+        # a foot slightly below the mesh; writing that pose directly to PhysX
+        # produces a first-step depenetration impulse.  Compute the smallest
+        # uniform root-Z lift that leaves every *reference rigid-body center*
+        # at least `safe_reference_reset_margin` above the queried terrain.
+        #
+        # The lift applies only to this simulator reset state.  In particular,
+        # it does not alter MotionLib data or the reference target used by the
+        # mimic controller/rewards after reset.
+        if self.config.safe_reference_reset:
+            spawned_body_pos = (
+                ref_state.rigid_body_pos
+                + self.respawn_root_offset[env_ids].unsqueeze(1)
+                + self.reference_root_residual[env_ids].unsqueeze(1)
+            )
+            ground_heights = self.terrain.get_ground_heights(spawned_body_pos)
+            clearance = spawned_body_pos[..., 2] - ground_heights
+            lift = (
+                self.config.safe_reference_reset_margin - clearance.amin(dim=1)
+            ).clamp_min(0.0)
+            new_states.root_pos[:, 2] += lift
+            self.safe_reference_reset_lift[env_ids] = lift
+
+        return new_states, new_object_states
     def reset(
         self,
         env_ids=None,
         sample_flat=False,
         force_default_mask=None,
         disable_motion_resample=False,
+        reference_root_residual: Optional[Tensor] = None,
+        reference_root_velocity_residual: Optional[Tensor] = None,
     ):
         """Reset environments and return observations.
 
@@ -1060,6 +1188,11 @@ class BaseEnv:
                                Only used if motion_lib exists.
             disable_motion_resample: If True, skip resampling motions (use existing motion_ids/times).
                                Useful for evaluation when you want to replay specific motions.
+            reference_root_residual: Optional per-environment XYZ translation
+                               applied consistently to the reference reset state
+                               and all subsequent mimic targets.
+            reference_root_velocity_residual: Optional matching XYZ velocity
+                               added to the reference reset and target velocity.
 
         Returns:
             obs: Dictionary of observation tensors
@@ -1074,6 +1207,37 @@ class BaseEnv:
         if isinstance(env_ids, list):
             env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
         env_ids = env_ids.to(self.device)
+        if reference_root_residual is None:
+            self.reference_root_residual[env_ids] = 0.0
+        else:
+            residual = torch.as_tensor(
+                reference_root_residual,
+                dtype=self.reference_root_residual.dtype,
+                device=self.device,
+            )
+            expected_shape = (len(env_ids), 3)
+            if tuple(residual.shape) != expected_shape:
+                raise ValueError(
+                    "reference_root_residual must have shape "
+                    f"{expected_shape}, got {tuple(residual.shape)}"
+                )
+            self.reference_root_residual[env_ids] = residual
+        if reference_root_velocity_residual is None:
+            self.reference_root_velocity_residual[env_ids] = 0.0
+        else:
+            velocity_residual = torch.as_tensor(
+                reference_root_velocity_residual,
+                dtype=self.reference_root_velocity_residual.dtype,
+                device=self.device,
+            )
+            expected_shape = (len(env_ids), 3)
+            if tuple(velocity_residual.shape) != expected_shape:
+                raise ValueError(
+                    "reference_root_velocity_residual must have shape "
+                    f"{expected_shape}, got {tuple(velocity_residual.shape)}"
+                )
+            self.reference_root_velocity_residual[env_ids] = velocity_residual
+        self.safe_reference_reset_lift[env_ids] = 0.0
 
         # Start with default reset for all envs
         new_states, new_object_states = self.compute_default_reset_state(
@@ -1122,6 +1286,8 @@ class BaseEnv:
         self.prev_contact_force_magnitudes[env_ids] = 0.0
         self._current_raw_action[env_ids] = 0.0
         self._current_processed_action[env_ids] = 0.0
+        self._filtered_policy_action[env_ids] = 0.0
+        self._filtered_policy_action_valid[env_ids] = False
 
         # Update cached noisy obs for the reset envs with fresh noise
         if self._current_noisy_obs is not None:
@@ -1292,23 +1458,66 @@ class BaseEnv:
                     device=self.device,
                 )
 
+            # Index 0 must be the state actually written to the simulator.
+            # This is normally identical to the reference frame, but can differ
+            # for terrain-aware safe reference reset (which lifts the simulator
+            # root out of mesh penetration).  Keeping index 0 physical prevents
+            # a synthetic jump between current observations and state history.
+            current_state = self.simulator.get_robot_state()
+            current_ground_heights = self.terrain.get_ground_heights(
+                current_state.rigid_body_pos[ref_env_ids, 0]
+            ).squeeze(-1)
+            current_body_contacts = current_state.rigid_body_contacts[ref_env_ids][
+                :, self.contact_body_ids
+            ].bool()
+
+            historical_rigid_body_pos = historical_state.rigid_body_pos.view(
+                num_ref_envs, buffer_size, -1, 3
+            )
+            historical_rigid_body_pos += self.respawn_root_offset[
+                ref_env_ids
+            ][:, None, None, :]
+            historical_rigid_body_pos += self.reference_root_residual[
+                ref_env_ids
+            ][:, None, None, :]
+            historical_rigid_body_rot = historical_state.rigid_body_rot.view(
+                num_ref_envs, buffer_size, -1, 4
+            )
+            historical_rigid_body_vel = historical_state.rigid_body_vel.view(
+                num_ref_envs, buffer_size, -1, 3
+            )
+            historical_rigid_body_vel += self.reference_root_velocity_residual[
+                ref_env_ids
+            ][:, None, None, :]
+            historical_rigid_body_ang_vel = historical_state.rigid_body_ang_vel.view(
+                num_ref_envs, buffer_size, -1, 3
+            )
+            historical_dof_pos = historical_state.dof_pos.view(
+                num_ref_envs, buffer_size, -1
+            )
+            historical_dof_vel = historical_state.dof_vel.view(
+                num_ref_envs, buffer_size, -1
+            )
+            historical_rigid_body_pos[:, 0] = current_state.rigid_body_pos[ref_env_ids]
+            historical_rigid_body_rot[:, 0] = current_state.rigid_body_rot[ref_env_ids]
+            historical_rigid_body_vel[:, 0] = current_state.rigid_body_vel[ref_env_ids]
+            historical_rigid_body_ang_vel[:, 0] = current_state.rigid_body_ang_vel[
+                ref_env_ids
+            ]
+            historical_dof_pos[:, 0] = current_state.dof_pos[ref_env_ids]
+            historical_dof_vel[:, 0] = current_state.dof_vel[ref_env_ids]
+            historical_ground_heights[:, 0] = current_ground_heights
+            historical_body_contacts[:, 0] = current_body_contacts
+
             # Reshape back to [num_ref_envs, buffer_size, ...]
             self.state_history.reset_from_states(
                 env_ids=ref_env_ids,
-                rigid_body_pos=historical_state.rigid_body_pos.view(
-                    num_ref_envs, buffer_size, -1, 3
-                ),
-                rigid_body_rot=historical_state.rigid_body_rot.view(
-                    num_ref_envs, buffer_size, -1, 4
-                ),
-                rigid_body_vel=historical_state.rigid_body_vel.view(
-                    num_ref_envs, buffer_size, -1, 3
-                ),
-                rigid_body_ang_vel=historical_state.rigid_body_ang_vel.view(
-                    num_ref_envs, buffer_size, -1, 3
-                ),
-                dof_pos=historical_state.dof_pos.view(num_ref_envs, buffer_size, -1),
-                dof_vel=historical_state.dof_vel.view(num_ref_envs, buffer_size, -1),
+                rigid_body_pos=historical_rigid_body_pos,
+                rigid_body_rot=historical_rigid_body_rot,
+                rigid_body_vel=historical_rigid_body_vel,
+                rigid_body_ang_vel=historical_rigid_body_ang_vel,
+                dof_pos=historical_dof_pos,
+                dof_vel=historical_dof_vel,
                 ground_heights=historical_ground_heights,
                 body_contacts=historical_body_contacts,
                 actions=None,  # Zero actions for historical reset
@@ -1472,6 +1681,13 @@ class BaseEnv:
             "reset_buf": self.reset_buf.clone(),
             "terminate_buf": self.terminate_buf.clone(),
             "respawn_root_offset": self.respawn_root_offset.clone(),
+            "reference_root_residual": self.reference_root_residual.clone(),
+            "reference_root_velocity_residual": (
+                self.reference_root_velocity_residual.clone()
+            ),
+            "safe_reference_reset_lift": self.safe_reference_reset_lift.clone(),
+            "filtered_policy_action": self._filtered_policy_action.clone(),
+            "filtered_policy_action_valid": self._filtered_policy_action_valid.clone(),
         }
         if self.state_history is not None:
             snapshot["state_history"] = self.state_history.save_state()
@@ -1507,6 +1723,20 @@ class BaseEnv:
         self.reset_buf.copy_(snapshot["reset_buf"])
         self.terminate_buf.copy_(snapshot["terminate_buf"])
         self.respawn_root_offset.copy_(snapshot["respawn_root_offset"])
+        if "reference_root_residual" in snapshot:
+            self.reference_root_residual.copy_(snapshot["reference_root_residual"])
+        if "reference_root_velocity_residual" in snapshot:
+            self.reference_root_velocity_residual.copy_(
+                snapshot["reference_root_velocity_residual"]
+            )
+        if "safe_reference_reset_lift" in snapshot:
+            self.safe_reference_reset_lift.copy_(snapshot["safe_reference_reset_lift"])
+        if "filtered_policy_action" in snapshot:
+            self._filtered_policy_action.copy_(snapshot["filtered_policy_action"])
+        if "filtered_policy_action_valid" in snapshot:
+            self._filtered_policy_action_valid.copy_(
+                snapshot["filtered_policy_action_valid"]
+            )
         self._current_noisy_obs = snapshot.get("_current_noisy_obs")
         self._current_context = None
 

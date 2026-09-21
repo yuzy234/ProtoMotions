@@ -401,31 +401,36 @@ class IsaacGymSimulator(Simulator):
 
     def _add_terrain(self) -> None:
         print("Adding terrain")
-        tm_params = gymapi.TriangleMeshParams()
-        tm_params.nb_vertices = self.terrain.vertices.shape[0]
-        tm_params.nb_triangles = self.terrain.triangles.shape[0]
-        tm_params.transform.p.x = 0
-        tm_params.transform.p.y = 0
-        tm_params.transform.p.z = 0.0
         # IsaacGym only supports "average" friction combine mode (PhysX default)
         assert (
             self.terrain.sim_config.combine_mode == CombineMode.AVERAGE
         ), "IsaacGym only supports average friction combine mode"
-        tm_params.static_friction = self.terrain.sim_config.static_friction
-        tm_params.dynamic_friction = self.terrain.sim_config.dynamic_friction
-        tm_params.restitution = self.terrain.sim_config.restitution
 
-        vertices = self.terrain.vertices
+        vertices = self.terrain.vertices.copy()
         height_offset = self.terrain.sim_config.height_offset
         vertices[..., 2] += height_offset
-
-        self._gym.add_triangle_mesh(
-            self._sim,
-            self.terrain.vertices.flatten(order="C"),
-            self.terrain.triangles.flatten(order="C"),
-            tm_params,
+        tile_offsets = getattr(
+            self.terrain,
+            "collision_tile_offsets",
+            np.zeros((1, 3), dtype=np.float32),
         )
-        print("Terrain added")
+        for tile_offset in tile_offsets:
+            tm_params = gymapi.TriangleMeshParams()
+            tm_params.nb_vertices = vertices.shape[0]
+            tm_params.nb_triangles = self.terrain.triangles.shape[0]
+            tm_params.transform.p.x = float(tile_offset[0])
+            tm_params.transform.p.y = float(tile_offset[1])
+            tm_params.transform.p.z = float(tile_offset[2])
+            tm_params.static_friction = self.terrain.sim_config.static_friction
+            tm_params.dynamic_friction = self.terrain.sim_config.dynamic_friction
+            tm_params.restitution = self.terrain.sim_config.restitution
+            self._gym.add_triangle_mesh(
+                self._sim,
+                vertices.flatten(order="C"),
+                self.terrain.triangles.flatten(order="C"),
+                tm_params,
+            )
+        print(f"Terrain added ({len(tile_offsets)} collision tile(s))")
 
     def _parse_sim_params(self) -> gymapi.SimParams:
         sim_params = gymapi.SimParams()

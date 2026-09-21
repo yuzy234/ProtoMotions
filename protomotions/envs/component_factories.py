@@ -62,6 +62,55 @@ from protomotions.envs.mdp_component import MdpComponent
 # =============================================================================
 
 
+def reset_transition_progress_obs_factory() -> MdpComponent:
+    """Expose smooth time-since-reset progress as a one-dimensional observation."""
+    from protomotions.envs.obs import scalar_to_column
+
+    return MdpComponent(
+        compute_func=scalar_to_column,
+        dynamic_vars={"x": EnvContext.mimic.reset_transition_progress},
+    )
+
+
+def physical_reference_reliability_factory() -> MdpComponent:
+    """Expose MotionLib's support/flight root confidence to the policy."""
+    from protomotions.envs.obs import scalar_to_column
+
+    return MdpComponent(
+        compute_func=scalar_to_column,
+        dynamic_vars={"x": EnvContext.mimic.reference_reliability},
+    )
+
+
+def contact_conditioned_takeoff_demand_factory(
+    support_body_ids: Optional[List[int]] = None,
+    vertical_speed_scale: float = 3.0,
+    horizon_weights: Optional[List[float]] = None,
+) -> MdpComponent:
+    """Expose support-gated future launch demand for directed exploration."""
+    from protomotions.envs.obs import build_contact_conditioned_takeoff_demand
+
+    params: Dict[str, Any] = {
+        "vertical_speed_scale": vertical_speed_scale,
+    }
+    if support_body_ids is not None:
+        params["support_body_ids"] = support_body_ids
+    if horizon_weights is not None:
+        params["horizon_weights"] = horizon_weights
+    return MdpComponent(
+        compute_func=build_contact_conditioned_takeoff_demand,
+        dynamic_vars={
+            "current_ref_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
+            "future_ref_root_vel": EnvContext.mimic.future_root_vel,
+            "current_ref_contacts": EnvContext.mimic.ref_state.rigid_body_contacts,
+            "future_reference_reliability": (
+                EnvContext.mimic.future_reference_reliability
+            ),
+        },
+        static_params=params,
+    )
+
+
 def max_coords_obs_factory(
     use_noisy: bool = False,
     local_obs: bool = True,
@@ -300,6 +349,73 @@ def mimic_target_poses_max_coords_factory(
     )
 
 
+def reliability_gated_mimic_target_poses_max_coords_factory(
+    use_noisy: bool = False,
+    with_velocities: bool = True,
+    with_relative: bool = True,
+    future_steps: Optional[Union[int, list]] = None,
+    minimum_global_weight: float = 0.0,
+    gravity_axis_only: bool = False,
+) -> MdpComponent:
+    """Pretrained max-coordinate command with gated global root motion."""
+    from protomotions.envs.obs import (
+        build_reliability_gated_max_coords_target_poses,
+    )
+
+    state = EnvContext.noisy if use_noisy else EnvContext.current
+    static_params = {
+        "with_velocities": with_velocities,
+        "with_relative": with_relative,
+        "w_last": True,
+        "minimum_global_weight": minimum_global_weight,
+        "gravity_axis_only": gravity_axis_only,
+    }
+    if future_steps is not None:
+        static_params["future_steps"] = future_steps
+
+    return MdpComponent(
+        compute_func=build_reliability_gated_max_coords_target_poses,
+        dynamic_vars={
+            "current_state_body_pos": state.rigid_body_pos,
+            "current_state_body_rot": state.rigid_body_rot,
+            "current_state_body_vel": state.rigid_body_vel,
+            "current_state_body_ang_vel": state.rigid_body_ang_vel,
+            "mimic_ref_pos": EnvContext.mimic.future_pos,
+            "mimic_ref_rot": EnvContext.mimic.future_rot,
+            "mimic_ref_vel": EnvContext.mimic.future_vel,
+            "mimic_ref_ang_vel": EnvContext.mimic.future_ang_vel,
+            "reference_reliability": EnvContext.mimic.reference_reliability,
+        },
+        static_params=static_params,
+    )
+
+
+def reference_reliability_factory(
+    linear_speed_soft: float = 4.0,
+    angular_speed_soft: float = 6.0,
+    linear_change_scale: float = 2.0,
+    angular_change_scale: float = 4.0,
+    min_reliability: float = 0.1,
+) -> MdpComponent:
+    """Confidence gate for video-derived multi-step motion commands."""
+    from protomotions.envs.obs.target_poses import build_reference_reliability
+
+    return MdpComponent(
+        compute_func=build_reference_reliability,
+        dynamic_vars={
+            "mimic_ref_vel": EnvContext.mimic.future_vel,
+            "mimic_ref_ang_vel": EnvContext.mimic.future_ang_vel,
+        },
+        static_params={
+            "linear_speed_soft": linear_speed_soft,
+            "angular_speed_soft": angular_speed_soft,
+            "linear_change_scale": linear_change_scale,
+            "angular_change_scale": angular_change_scale,
+            "min_reliability": min_reliability,
+        },
+    )
+
+
 def mimic_target_poses_future_rel_factory(
     use_noisy: bool = False,
     future_steps: Optional[int] = None,
@@ -329,6 +445,51 @@ def mimic_target_poses_future_rel_factory(
             "mimic_ref_pos": EnvContext.mimic.future_pos,
             "mimic_ref_rot": EnvContext.mimic.future_rot,
         },
+        static_params=params,
+    )
+
+
+def reliability_gated_mimic_target_poses_future_rel_factory(
+    use_noisy: bool = False,
+    future_steps: Optional[int] = None,
+    minimum_global_weight: float = 0.0,
+    gravity_axis_only: bool = False,
+    include_reliability: bool = True,
+    include_trusted_vertical_anchors: bool = False,
+    include_trusted_vertical_velocity: bool = False,
+) -> MdpComponent:
+    """Temporal command aggregation gated at each future horizon."""
+    from protomotions.envs.obs import (
+        build_reliability_gated_max_coords_target_poses_future_rel,
+    )
+
+    state = EnvContext.noisy if use_noisy else EnvContext.current
+    params = {
+        "w_last": True,
+        "minimum_global_weight": minimum_global_weight,
+        "gravity_axis_only": gravity_axis_only,
+        "include_reliability": include_reliability,
+        "include_trusted_vertical_anchors": include_trusted_vertical_anchors,
+        "include_trusted_vertical_velocity": include_trusted_vertical_velocity,
+    }
+    if future_steps is not None:
+        params["future_steps"] = future_steps
+
+    dynamic_vars = {
+        "current_state_body_pos": state.rigid_body_pos,
+        "current_state_body_rot": state.rigid_body_rot,
+        "mimic_ref_pos": EnvContext.mimic.future_pos,
+        "mimic_ref_rot": EnvContext.mimic.future_rot,
+        "future_reference_reliability": (
+            EnvContext.mimic.future_reference_reliability
+        ),
+    }
+    if include_trusted_vertical_velocity:
+        dynamic_vars["mimic_ref_vel"] = EnvContext.mimic.future_vel
+
+    return MdpComponent(
+        compute_func=build_reliability_gated_max_coords_target_poses_future_rel,
+        dynamic_vars=dynamic_vars,
         static_params=params,
     )
 
@@ -438,7 +599,11 @@ def mimic_deploy_target_poses_factory(
 # =============================================================================
 
 
-def action_smoothness_factory(weight: float = -0.02) -> MdpComponent:
+def action_smoothness_factory(
+    weight: float = -0.02,
+    zero_during_grace_period: bool = False,
+    ignore_first_steps: int = 0,
+) -> MdpComponent:
     """Factory for action smoothness reward.
 
     Args:
@@ -447,15 +612,226 @@ def action_smoothness_factory(weight: float = -0.02) -> MdpComponent:
     Returns:
         MdpComponent configured for action smoothness.
     """
-    from protomotions.envs.rewards import compute_action_smoothness
+    from protomotions.envs.rewards import (
+        compute_action_smoothness,
+        compute_reset_aware_action_smoothness,
+    )
+
+    if ignore_first_steps < 0:
+        raise ValueError("ignore_first_steps must be non-negative.")
+    reset_aware = ignore_first_steps > 0
+    dynamic_vars = {
+        "current_processed_action": EnvContext.current_processed_action,
+        "previous_processed_action": EnvContext.previous_processed_action,
+    }
+    static_params = {
+        "weight": weight,
+        "zero_during_grace_period": zero_during_grace_period,
+    }
+    if reset_aware:
+        dynamic_vars["episode_progress"] = EnvContext.episode_progress
+        static_params["ignore_first_steps"] = ignore_first_steps
 
     return MdpComponent(
-        compute_func=compute_action_smoothness,
+        compute_func=(
+            compute_reset_aware_action_smoothness
+            if reset_aware
+            else compute_action_smoothness
+        ),
+        dynamic_vars=dynamic_vars,
+        static_params=static_params,
+    )
+
+
+def action_acceleration_factory(
+    weight: float = -0.01,
+    indices: Optional[List[int]] = None,
+    ignore_first_steps: int = 2,
+) -> MdpComponent:
+    """Factory for a reset-aware action second-difference penalty.
+
+    ``indices`` allows the penalty to target unstable joints without damping
+    the entire body. The environment must retain at least two history steps.
+    """
+    from protomotions.envs.rewards import compute_reset_aware_action_acceleration
+
+    if ignore_first_steps < 0:
+        raise ValueError("ignore_first_steps must be non-negative.")
+    return MdpComponent(
+        compute_func=compute_reset_aware_action_acceleration,
+        dynamic_vars={
+            "current_processed_action": EnvContext.current_processed_action,
+            "historical_processed_actions": EnvContext.historical.processed_actions,
+            "episode_progress": EnvContext.episode_progress,
+        },
+        static_params={
+            "weight": weight,
+            "indices": indices,
+            "ignore_first_steps": ignore_first_steps,
+        },
+    )
+
+
+def demand_relaxed_action_smoothness_factory(
+    weight: float = -0.02,
+    support_body_ids: Optional[List[int]] = None,
+    vertical_speed_scale: float = 3.0,
+    horizon_weights: Optional[List[float]] = None,
+    minimum_multiplier: float = 0.1,
+    ignore_first_steps: int = 1,
+) -> MdpComponent:
+    """Action smoothness that permits a reliable required support impulse."""
+    from protomotions.envs.rewards import compute_demand_relaxed_action_smoothness
+
+    return MdpComponent(
+        compute_func=compute_demand_relaxed_action_smoothness,
         dynamic_vars={
             "current_processed_action": EnvContext.current_processed_action,
             "previous_processed_action": EnvContext.previous_processed_action,
+            "episode_progress": EnvContext.episode_progress,
+            "current_ref_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
+            "future_ref_root_vel": EnvContext.mimic.future_root_vel,
+            "current_ref_contacts": EnvContext.mimic.ref_state.rigid_body_contacts,
+            "future_reference_reliability": (
+                EnvContext.mimic.future_reference_reliability
+            ),
         },
-        static_params={"weight": weight},
+        static_params={
+            "weight": weight,
+            "support_body_ids": support_body_ids,
+            "vertical_speed_scale": vertical_speed_scale,
+            "horizon_weights": horizon_weights,
+            "minimum_multiplier": minimum_multiplier,
+            "ignore_first_steps": ignore_first_steps,
+        },
+    )
+
+
+def demand_relaxed_action_acceleration_factory(
+    weight: float = -0.01,
+    indices: Optional[List[int]] = None,
+    support_body_ids: Optional[List[int]] = None,
+    vertical_speed_scale: float = 3.0,
+    horizon_weights: Optional[List[float]] = None,
+    minimum_multiplier: float = 0.1,
+    ignore_first_steps: int = 2,
+) -> MdpComponent:
+    """Action acceleration regularization relaxed at required takeoff."""
+    from protomotions.envs.rewards import compute_demand_relaxed_action_acceleration
+
+    return MdpComponent(
+        compute_func=compute_demand_relaxed_action_acceleration,
+        dynamic_vars={
+            "current_processed_action": EnvContext.current_processed_action,
+            "historical_processed_actions": EnvContext.historical.processed_actions,
+            "episode_progress": EnvContext.episode_progress,
+            "current_ref_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
+            "future_ref_root_vel": EnvContext.mimic.future_root_vel,
+            "current_ref_contacts": EnvContext.mimic.ref_state.rigid_body_contacts,
+            "future_reference_reliability": (
+                EnvContext.mimic.future_reference_reliability
+            ),
+        },
+        static_params={
+            "weight": weight,
+            "indices": indices,
+            "support_body_ids": support_body_ids,
+            "vertical_speed_scale": vertical_speed_scale,
+            "horizon_weights": horizon_weights,
+            "minimum_multiplier": minimum_multiplier,
+            "ignore_first_steps": ignore_first_steps,
+        },
+    )
+
+
+def relative_body_angular_jerk_factory(
+    weight: float,
+    body_indices: List[int],
+    parent_indices: List[int],
+    ignore_first_steps: int = 2,
+    min_value: Optional[float] = -0.15,
+) -> MdpComponent:
+    """Factory for selected child-parent angular-velocity jerk."""
+    from protomotions.envs.rewards import (
+        compute_reset_aware_relative_body_angular_jerk,
+    )
+
+    if len(body_indices) != len(parent_indices):
+        raise ValueError("body_indices and parent_indices must have equal length.")
+    static_params = {
+        "weight": weight,
+        "body_indices": body_indices,
+        "parent_indices": parent_indices,
+        "ignore_first_steps": ignore_first_steps,
+    }
+    if min_value is not None:
+        static_params["min_value"] = min_value
+    return MdpComponent(
+        compute_func=compute_reset_aware_relative_body_angular_jerk,
+        dynamic_vars={
+            "current_rigid_body_ang_vel": EnvContext.current.rigid_body_ang_vel,
+            "historical_rigid_body_ang_vel": EnvContext.historical.rigid_body_ang_vel,
+            "episode_progress": EnvContext.episode_progress,
+        },
+        static_params=static_params,
+    )
+
+
+def reliability_weighted_gr_rew_factory(
+    weight: float = 0.3,
+    coefficient: float = -5.0,
+    angular_speed_soft: float = 4.0,
+    angular_speed_scale: float = 2.0,
+    min_reliability: float = 0.1,
+) -> MdpComponent:
+    """Rotation tracking that distrusts implausibly fast reference bodies."""
+    from protomotions.envs.rewards import compute_reliability_weighted_gr_rew
+
+    return MdpComponent(
+        compute_func=compute_reliability_weighted_gr_rew,
+        dynamic_vars={
+            "current_rigid_body_rot": EnvContext.current.rigid_body_rot,
+            "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
+            "ref_rigid_body_ang_vel": EnvContext.mimic.ref_state.rigid_body_ang_vel,
+        },
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "angular_speed_soft": angular_speed_soft,
+            "angular_speed_scale": angular_speed_scale,
+            "min_reliability": min_reliability,
+        },
+    )
+
+
+def reliability_weighted_relative_body_ori_rew_factory(
+    weight: float = 0.1,
+    sigma: float = 0.4,
+    angular_speed_soft: float = 4.0,
+    angular_speed_scale: float = 2.0,
+    min_reliability: float = 0.1,
+) -> MdpComponent:
+    """Heading-relative orientation tracking with reference reliability."""
+    from protomotions.envs.rewards import (
+        compute_reliability_weighted_relative_body_ori_rew,
+    )
+
+    return MdpComponent(
+        compute_func=compute_reliability_weighted_relative_body_ori_rew,
+        dynamic_vars={
+            "current_rigid_body_rot": EnvContext.current.rigid_body_rot,
+            "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
+            "ref_rigid_body_ang_vel": EnvContext.mimic.ref_state.rigid_body_ang_vel,
+            "current_anchor_rot": EnvContext.current.anchor_rot,
+            "anchor_idx": EnvContext.mimic.anchor_idx,
+        },
+        static_params={
+            "weight": weight,
+            "sigma": sigma,
+            "angular_speed_soft": angular_speed_soft,
+            "angular_speed_scale": angular_speed_scale,
+            "min_reliability": min_reliability,
+        },
     )
 
 
@@ -478,6 +854,199 @@ def gt_rew_factory(weight: float = 0.5, coefficient: float = -100.0) -> MdpCompo
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
         },
         static_params={"weight": weight, "coefficient": coefficient},
+    )
+
+
+def reliability_blended_position_rew_factory(
+    weight: float = 0.5,
+    global_coefficient: float = -25.0,
+    relative_coefficient: float = -25.0,
+    minimum_absolute_weight: float = 0.05,
+    gravity_axis_only: bool = False,
+) -> MdpComponent:
+    """Blend absolute and root-relative tracking using physical confidence."""
+    from protomotions.envs.rewards import (
+        compute_reliability_blended_position_rew,
+    )
+
+    return MdpComponent(
+        compute_func=compute_reliability_blended_position_rew,
+        dynamic_vars={
+            "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "reference_reliability": EnvContext.mimic.reference_reliability,
+        },
+        static_params={
+            "weight": weight,
+            "global_coefficient": global_coefficient,
+            "relative_coefficient": relative_coefficient,
+            "minimum_absolute_weight": minimum_absolute_weight,
+            "gravity_axis_only": gravity_axis_only,
+        },
+    )
+
+
+def terrain_feasible_gt_rew_factory(
+    weight: float = 0.5,
+    coefficient: float = -25.0,
+    penetration_margin: float = 0.02,
+    penetration_scale: float = 0.05,
+    min_z_weight: float = 0.05,
+) -> MdpComponent:
+    """Position tracking with penetration-aware reference-Z weighting."""
+    from protomotions.envs.rewards import compute_terrain_feasible_gt_rew
+
+    return MdpComponent(
+        compute_func=compute_terrain_feasible_gt_rew,
+        dynamic_vars={
+            "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "ref_ground_heights": EnvContext.mimic.ref_ground_heights,
+        },
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "penetration_margin": penetration_margin,
+            "penetration_scale": penetration_scale,
+            "min_z_weight": min_z_weight,
+        },
+    )
+
+
+def terrain_projected_gt_rew_factory(
+    weight: float = 0.5,
+    coefficient: float = -25.0,
+    clearance_margin: float = 0.02,
+    max_lift: float = 0.15,
+) -> MdpComponent:
+    """Global-position tracking against the closest uniformly lifted reference."""
+    from protomotions.envs.rewards import compute_terrain_projected_gt_rew
+
+    return MdpComponent(
+        compute_func=compute_terrain_projected_gt_rew,
+        dynamic_vars={
+            "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "ref_ground_heights": EnvContext.mimic.ref_ground_heights,
+        },
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "clearance_margin": clearance_margin,
+            "max_lift": max_lift,
+        },
+    )
+
+
+def blended_terrain_feasible_gt_rew_factory(
+    weight: float = 0.5,
+    coefficient: float = -25.0,
+    penetration_margin: float = 0.02,
+    penetration_scale: float = 0.05,
+    min_z_weight: float = 0.05,
+) -> MdpComponent:
+    """Feasible global tracking with a smooth safe-reset reward transition."""
+    from protomotions.envs.rewards import compute_blended_terrain_feasible_gt_rew
+
+    return MdpComponent(
+        compute_func=compute_blended_terrain_feasible_gt_rew,
+        dynamic_vars={
+            "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "ref_ground_heights": EnvContext.mimic.ref_ground_heights,
+            "safe_reset_reward_lift": EnvContext.mimic.safe_reset_reward_lift,
+        },
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "penetration_margin": penetration_margin,
+            "penetration_scale": penetration_scale,
+            "min_z_weight": min_z_weight,
+        },
+    )
+
+
+def blended_rh_rew_factory(
+    weight: float = 0.1,
+    coefficient: float = -20.0,
+) -> MdpComponent:
+    """Root-height reward consistent with smooth safe-reset target blending."""
+    from protomotions.envs.rewards import compute_blended_rh_rew
+
+    return MdpComponent(
+        compute_func=compute_blended_rh_rew,
+        dynamic_vars={
+            "current_root_height": EnvContext.current.root_height,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "safe_reset_reward_lift": EnvContext.mimic.safe_reset_reward_lift,
+        },
+        static_params={"weight": weight, "coefficient": coefficient},
+    )
+
+
+def terrain_projected_rh_rew_factory(
+    weight: float = 0.1,
+    coefficient: float = -20.0,
+    clearance_margin: float = 0.02,
+    max_lift: float = 0.15,
+) -> MdpComponent:
+    """Root-height tracking consistent with terrain-projected position tracking."""
+    from protomotions.envs.rewards import compute_terrain_projected_rh_rew
+
+    return MdpComponent(
+        compute_func=compute_terrain_projected_rh_rew,
+        dynamic_vars={
+            "current_root_height": EnvContext.current.root_height,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "ref_ground_heights": EnvContext.mimic.ref_ground_heights,
+        },
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "clearance_margin": clearance_margin,
+            "max_lift": max_lift,
+        },
+    )
+
+
+def reference_feasible_lift_metric_factory(
+    clearance_margin: float = 0.02,
+    max_lift: float = 0.15,
+) -> MdpComponent:
+    """Zero-weight diagnostic for the reward target's uniform Z lift."""
+    from protomotions.envs.rewards import compute_reference_feasible_lift
+
+    return MdpComponent(
+        compute_func=compute_reference_feasible_lift,
+        dynamic_vars={
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "ref_ground_heights": EnvContext.mimic.ref_ground_heights,
+        },
+        static_params={
+            "weight": 0.0,
+            "clearance_margin": clearance_margin,
+            "max_lift": max_lift,
+        },
+    )
+
+
+def reference_penetration_metric_factory(*, fraction: bool = False) -> MdpComponent:
+    """Zero-weight reward component used only to expose penetration diagnostics."""
+    if fraction:
+        from protomotions.envs.rewards import compute_reference_penetration_fraction
+
+        compute_func = compute_reference_penetration_fraction
+    else:
+        from protomotions.envs.rewards import compute_reference_penetration_depth
+
+        compute_func = compute_reference_penetration_depth
+    return MdpComponent(
+        compute_func=compute_func,
+        dynamic_vars={
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "ref_ground_heights": EnvContext.mimic.ref_ground_heights,
+        },
+        static_params={"weight": 0.0},
     )
 
 
@@ -522,6 +1091,70 @@ def gv_rew_factory(weight: float = 0.1, coefficient: float = -0.5) -> MdpCompone
             "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
         },
         static_params={"weight": weight, "coefficient": coefficient},
+    )
+
+
+def reliability_blended_velocity_rew_factory(
+    weight: float = 0.1,
+    global_coefficient: float = -0.5,
+    relative_coefficient: float = -0.5,
+    minimum_absolute_weight: float = 0.05,
+    gravity_axis_only: bool = False,
+) -> MdpComponent:
+    """Linear-velocity reward invariant to an untrusted shared root velocity."""
+    from protomotions.envs.rewards import (
+        compute_reliability_blended_velocity_rew,
+    )
+
+    return MdpComponent(
+        compute_func=compute_reliability_blended_velocity_rew,
+        dynamic_vars={
+            "current_rigid_body_vel": EnvContext.current.rigid_body_vel,
+            "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
+            "reference_reliability": EnvContext.mimic.reference_reliability,
+        },
+        static_params={
+            "weight": weight,
+            "global_coefficient": global_coefficient,
+            "relative_coefficient": relative_coefficient,
+            "minimum_absolute_weight": minimum_absolute_weight,
+            "gravity_axis_only": gravity_axis_only,
+        },
+    )
+
+
+def contact_transition_vertical_velocity_error_factory(
+    weight: float = -0.25,
+    support_body_ids: Optional[List[int]] = None,
+    vertical_speed_scale: float = 3.0,
+    horizon_weights: Optional[List[float]] = None,
+    huber_delta: float = 0.5,
+    max_error: float = 5.0,
+) -> MdpComponent:
+    """Non-saturating root-vz error localized to supported take-off phases."""
+    from protomotions.envs.rewards import (
+        compute_contact_transition_vertical_velocity_error,
+    )
+
+    return MdpComponent(
+        compute_func=compute_contact_transition_vertical_velocity_error,
+        dynamic_vars={
+            "current_rigid_body_vel": EnvContext.current.rigid_body_vel,
+            "ref_rigid_body_vel": EnvContext.mimic.ref_state.rigid_body_vel,
+            "future_ref_root_vel": EnvContext.mimic.future_root_vel,
+            "current_ref_contacts": EnvContext.mimic.ref_state.rigid_body_contacts,
+            "future_reference_reliability": (
+                EnvContext.mimic.future_reference_reliability
+            ),
+        },
+        static_params={
+            "weight": weight,
+            "support_body_ids": support_body_ids,
+            "vertical_speed_scale": vertical_speed_scale,
+            "horizon_weights": horizon_weights,
+            "huber_delta": huber_delta,
+            "max_error": max_error,
+        },
     )
 
 
@@ -690,7 +1323,9 @@ def contact_force_change_rew_factory(
 
     static_params = {
         "weight": weight,
-        "threshold": threshold,
+        # `threshold` is reserved termination metadata in MdpComponent, so use
+        # an unambiguous kernel argument name here.
+        "force_change_threshold": threshold,
         "zero_during_grace_period": zero_during_grace_period,
     }
     if min_value is not None:
@@ -701,6 +1336,31 @@ def contact_force_change_rew_factory(
         dynamic_vars={
             "current_contact_force_magnitudes": EnvContext.current_contact_force_magnitudes,
             "prev_contact_force_magnitudes": EnvContext.prev_contact_force_magnitudes,
+        },
+        static_params=static_params,
+    )
+
+
+def foot_sliding_rew_factory(
+    weight: float = -0.05,
+    min_value: Optional[float] = -0.2,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Penalize horizontal foot speed only during measured physical contact."""
+    from protomotions.envs.rewards import compute_foot_sliding_rew
+
+    static_params = {
+        "weight": weight,
+        "zero_during_grace_period": zero_during_grace_period,
+    }
+    if min_value is not None:
+        static_params["min_value"] = min_value
+    return MdpComponent(
+        compute_func=compute_foot_sliding_rew,
+        dynamic_vars={
+            "rigid_body_vel": EnvContext.current.rigid_body_vel,
+            "rigid_body_contacts": EnvContext.current.rigid_body_contacts,
+            "contact_body_ids": EnvContext.contact_body_ids,
         },
         static_params=static_params,
     )
@@ -729,6 +1389,31 @@ def tracking_error_term_factory(threshold: float = 0.5) -> MdpComponent:
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
         },
         static_params={"threshold": threshold},
+    )
+
+
+def reliability_blended_tracking_error_term_factory(
+    threshold: float = 0.5,
+    minimum_absolute_weight: float = 0.05,
+    gravity_axis_only: bool = False,
+) -> MdpComponent:
+    """Termination that relaxes only an untrusted shared root translation."""
+    from protomotions.envs.terminations import (
+        compute_reliability_blended_tracking_error,
+    )
+
+    return MdpComponent(
+        compute_func=compute_reliability_blended_tracking_error,
+        dynamic_vars={
+            "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "reference_reliability": EnvContext.mimic.reference_reliability,
+        },
+        static_params={
+            "error_threshold": threshold,
+            "minimum_absolute_weight": minimum_absolute_weight,
+            "gravity_axis_only": gravity_axis_only,
+        },
     )
 
 
@@ -1044,6 +1729,33 @@ def gt_error_factory(threshold: float = None) -> MdpComponent:
     )
 
 
+def reliability_blended_gt_error_factory(
+    threshold: float = None,
+    minimum_absolute_weight: float = 0.05,
+    gravity_axis_only: bool = False,
+) -> MdpComponent:
+    """Mean position error that distrusts only noisy shared root translation."""
+    from protomotions.envs.terminations import (
+        reliability_blended_mean_body_pos_error,
+    )
+
+    static_params = {
+        "minimum_absolute_weight": minimum_absolute_weight,
+        "gravity_axis_only": gravity_axis_only,
+    }
+    if threshold is not None:
+        static_params["threshold"] = threshold
+    return MdpComponent(
+        compute_func=reliability_blended_mean_body_pos_error,
+        dynamic_vars={
+            "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
+            "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
+            "reference_reliability": EnvContext.mimic.reference_reliability,
+        },
+        static_params=static_params,
+    )
+
+
 def max_joint_error_factory(threshold: float = None) -> MdpComponent:
     """Factory for max body position error metric.
 
@@ -1266,25 +1978,47 @@ def steering_velocity_error_factory(
 __all__ = [
     # Observation factories
     "max_coords_obs",
+    "reset_transition_progress_obs_factory",
+    "physical_reference_reliability_factory",
     "reduced_coords_obs",
     "historical_max_coords_obs",
     "historical_reduced_coords_obs",
     "previous_actions",
     "mimic_target_poses_max_coords",
+    "reliability_gated_mimic_target_poses_max_coords_factory",
+    "reliability_gated_mimic_target_poses_future_rel_factory",
+    "reference_reliability_factory",
     "mimic_target_poses_future_rel",
     "mimic_target_poses_reduced_coords",
     "mimic_deploy_target_poses",
     # Reward factories
     "action_smoothness",
+    "action_acceleration_factory",
+    "demand_relaxed_action_smoothness_factory",
+    "demand_relaxed_action_acceleration_factory",
+    "relative_body_angular_jerk_factory",
+    "reliability_weighted_gr_rew_factory",
+    "reliability_weighted_relative_body_ori_rew_factory",
     "gt_rew",
+    "reliability_blended_position_rew_factory",
+    "terrain_feasible_gt_rew_factory",
+    "terrain_projected_gt_rew_factory",
+    "terrain_projected_rh_rew_factory",
+    "blended_terrain_feasible_gt_rew_factory",
+    "blended_rh_rew_factory",
+    "reference_feasible_lift_metric_factory",
+    "reference_penetration_metric_factory",
     "gr_rew",
     "gv_rew",
+    "reliability_blended_velocity_rew_factory",
+    "contact_transition_vertical_velocity_error_factory",
     "gav_rew",
     "rh_rew",
     "mimic_tracking_rewards_factory",
     "pow_rew",
     "contact_match_rew",
     "contact_force_change_rew",
+    "foot_sliding_rew_factory",
     # BeyondMimic reward factories
     "global_anchor_pos_rew",
     "global_anchor_ori_rew",
@@ -1294,6 +2028,7 @@ __all__ = [
     "global_body_ang_vel_rew",
     # Termination factories
     "tracking_error_term",
+    "reliability_blended_tracking_error_term_factory",
     "anchor_pos_error_term",
     "anchor_ori_error_term",
     "relative_body_pos_error_term",
@@ -1301,6 +2036,7 @@ __all__ = [
     # Evaluation metric factories
     "anchor_height_error_metric_factory",
     "gt_error_factory",
+    "reliability_blended_gt_error_factory",
     "max_joint_error_factory",
     "gr_error_factory",
     "anchor_pos_metric_factory",

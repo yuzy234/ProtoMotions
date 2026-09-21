@@ -40,7 +40,7 @@ Includes:
 
 import torch
 from torch import Tensor
-from typing import Optional
+from typing import List, Optional
 
 from protomotions.utils.rotations import (
     quat_angle_diff_norm,
@@ -77,6 +77,263 @@ def compute_gt_rew(
     )
 
 
+def compute_reliability_blended_position_rew(
+    current_rigid_body_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    reference_reliability: Tensor,
+    global_coefficient: float = -25.0,
+    relative_coefficient: float = -25.0,
+    minimum_absolute_weight: float = 0.05,
+    gravity_axis_only: bool = False,
+) -> Tensor:
+    """Track absolute position only in proportion to physical confidence.
+
+    The low-confidence fallback is root-relative body-position tracking, not a
+    zero reward.  This preserves the observed articulation while allowing
+    physics to reject a floating or penetrating global root trajectory.
+    """
+    if not 0.0 <= minimum_absolute_weight <= 1.0:
+        raise ValueError("minimum_absolute_weight must lie in [0, 1]")
+    reliability = reference_reliability.reshape(-1).clamp(0.0, 1.0)
+    absolute_weight = minimum_absolute_weight + (
+        1.0 - minimum_absolute_weight
+    ) * reliability
+    if gravity_axis_only:
+        vertical_offset = (
+            current_rigid_body_pos[:, :1, 2:3]
+            - ref_rigid_body_pos[:, :1, 2:3]
+        ) * (1.0 - absolute_weight[:, None, None])
+        root_offset = torch.cat(
+            (
+                torch.zeros_like(vertical_offset).expand(-1, -1, 2),
+                vertical_offset,
+            ),
+            dim=-1,
+        )
+        gated_reference = ref_rigid_body_pos + root_offset
+        return mean_squared_error_exp(
+            current_rigid_body_pos,
+            gated_reference,
+            global_coefficient,
+        )
+    absolute_reward = mean_squared_error_exp(
+        current_rigid_body_pos,
+        ref_rigid_body_pos,
+        global_coefficient,
+    )
+    current_relative = (
+        current_rigid_body_pos - current_rigid_body_pos[:, :1, :]
+    )
+    reference_relative = ref_rigid_body_pos - ref_rigid_body_pos[:, :1, :]
+    relative_reward = mean_squared_error_exp(
+        current_relative,
+        reference_relative,
+        relative_coefficient,
+    )
+    return absolute_weight * absolute_reward + (
+        1.0 - absolute_weight
+    ) * relative_reward
+
+
+def compute_terrain_feasible_gt_rew(
+    current_rigid_body_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    ref_ground_heights: Tensor,
+    coefficient: float = -25.0,
+    penetration_margin: float = 0.02,
+    penetration_scale: float = 0.05,
+    min_z_weight: float = 0.05,
+) -> Tensor:
+    """Absolute body-position reward robust to an infeasible reference height.
+
+    XY tracking is unchanged.  The Z error of a reference body is smoothly
+    downweighted only when that body's origin lies below the local terrain plus
+    ``penetration_margin``.  With no penetration this is exactly the standard
+    global-position exponential MSE reward.
+
+    This does not move or rewrite the reference motion.  It only prevents an
+    impossible below-terrain Z target from dominating the policy gradient.
+    """
+    if penetration_scale <= 0:
+        raise ValueError("penetration_scale must be positive.")
+    if not 0.0 <= min_z_weight <= 1.0:
+        raise ValueError("min_z_weight must be in [0, 1].")
+
+    if ref_ground_heights.ndim == ref_rigid_body_pos.ndim:
+        ref_ground_heights = ref_ground_heights.squeeze(-1)
+    penetration = (
+        ref_ground_heights + penetration_margin - ref_rigid_body_pos[..., 2]
+    ).clamp_min(0.0)
+    feasible_weight = torch.exp(-penetration / penetration_scale)
+    z_weight = min_z_weight + (1.0 - min_z_weight) * feasible_weight
+
+    squared_error = (current_rigid_body_pos - ref_rigid_body_pos).pow(2)
+    weighted_error = torch.cat(
+        [squared_error[..., :2], squared_error[..., 2:3] * z_weight.unsqueeze(-1)],
+        dim=-1,
+    )
+    return torch.exp(coefficient * weighted_error.mean(dim=(-2, -1)))
+
+
+def compute_blended_terrain_feasible_gt_rew(
+    current_rigid_body_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    ref_ground_heights: Tensor,
+    safe_reset_reward_lift: Tensor,
+    coefficient: float = -25.0,
+    penetration_margin: float = 0.02,
+    penetration_scale: float = 0.05,
+    min_z_weight: float = 0.05,
+) -> Tensor:
+    """Terrain-feasible tracking with a smooth safe-reset target transition."""
+    blended_ref = torch.cat(
+        (
+            ref_rigid_body_pos[..., :2],
+            ref_rigid_body_pos[..., 2:3]
+            + safe_reset_reward_lift[:, None, None],
+        ),
+        dim=-1,
+    )
+    return compute_terrain_feasible_gt_rew(
+        current_rigid_body_pos=current_rigid_body_pos,
+        ref_rigid_body_pos=blended_ref,
+        ref_ground_heights=ref_ground_heights,
+        coefficient=coefficient,
+        penetration_margin=penetration_margin,
+        penetration_scale=penetration_scale,
+        min_z_weight=min_z_weight,
+    )
+
+
+def compute_blended_rh_rew(
+    current_root_height: Tensor,
+    ref_rigid_body_pos: Tensor,
+    safe_reset_reward_lift: Tensor,
+    coefficient: float = -20.0,
+) -> Tensor:
+    """Root-height target consistent with the smooth safe-reset transition."""
+    ref_root_height = (
+        ref_rigid_body_pos[:, 0, 2] + safe_reset_reward_lift
+    )
+    return mean_squared_error_exp(
+        current_root_height,
+        ref_root_height,
+        coefficient,
+    )
+
+
+def _compute_reference_feasible_lift(
+    ref_rigid_body_pos: Tensor,
+    ref_ground_heights: Tensor,
+    clearance_margin: float,
+    max_lift: float,
+) -> Tensor:
+    """Return the minimum uniform Z lift that clears all reference body origins."""
+    if ref_ground_heights.ndim == ref_rigid_body_pos.ndim:
+        ref_ground_heights = ref_ground_heights.squeeze(-1)
+    required_lift = (
+        ref_ground_heights + clearance_margin - ref_rigid_body_pos[..., 2]
+    ).amax(dim=-1).clamp_min(0.0)
+    if max_lift > 0.0:
+        required_lift = required_lift.clamp_max(max_lift)
+    return required_lift
+
+
+def compute_terrain_projected_gt_rew(
+    current_rigid_body_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    ref_ground_heights: Tensor,
+    coefficient: float = -25.0,
+    clearance_margin: float = 0.02,
+    max_lift: float = 0.15,
+) -> Tensor:
+    """Track the closest uniformly lifted, terrain-feasible reference pose.
+
+    Safe reference reset lifts the complete simulated character.  Comparing that
+    state against the original (possibly penetrating) global reference makes the
+    reward immediately command the character back into the terrain.  This kernel
+    applies the same minimum uniform lift to the *reward target only*.  MotionLib,
+    future-pose observations, exported reference data, and visualization markers
+    remain unchanged.
+    """
+    lift = _compute_reference_feasible_lift(
+        ref_rigid_body_pos,
+        ref_ground_heights,
+        clearance_margin,
+        max_lift,
+    )
+    projected_ref = torch.cat(
+        (
+            ref_rigid_body_pos[..., :2],
+            ref_rigid_body_pos[..., 2:3] + lift[:, None, None],
+        ),
+        dim=-1,
+    )
+    return mean_squared_error_exp(
+        current_rigid_body_pos,
+        projected_ref,
+        coefficient,
+    )
+
+
+def compute_terrain_projected_rh_rew(
+    current_root_height: Tensor,
+    ref_rigid_body_pos: Tensor,
+    ref_ground_heights: Tensor,
+    coefficient: float = -20.0,
+    clearance_margin: float = 0.02,
+    max_lift: float = 0.15,
+) -> Tensor:
+    """Root-height reward consistent with ``compute_terrain_projected_gt_rew``."""
+    lift = _compute_reference_feasible_lift(
+        ref_rigid_body_pos,
+        ref_ground_heights,
+        clearance_margin,
+        max_lift,
+    )
+    projected_root_height = ref_rigid_body_pos[:, 0, 2] + lift
+    return mean_squared_error_exp(
+        current_root_height,
+        projected_root_height,
+        coefficient,
+    )
+
+
+def compute_reference_feasible_lift(
+    ref_rigid_body_pos: Tensor,
+    ref_ground_heights: Tensor,
+    clearance_margin: float = 0.02,
+    max_lift: float = 0.15,
+) -> Tensor:
+    """Expose the per-frame feasible-reference lift as a zero-weight metric."""
+    return _compute_reference_feasible_lift(
+        ref_rigid_body_pos,
+        ref_ground_heights,
+        clearance_margin,
+        max_lift,
+    )
+
+
+def compute_reference_penetration_depth(
+    ref_rigid_body_pos: Tensor,
+    ref_ground_heights: Tensor,
+) -> Tensor:
+    """Mean positive reference-body penetration depth, in meters."""
+    if ref_ground_heights.ndim == ref_rigid_body_pos.ndim:
+        ref_ground_heights = ref_ground_heights.squeeze(-1)
+    return (ref_ground_heights - ref_rigid_body_pos[..., 2]).clamp_min(0.0).mean(-1)
+
+
+def compute_reference_penetration_fraction(
+    ref_rigid_body_pos: Tensor,
+    ref_ground_heights: Tensor,
+) -> Tensor:
+    """Fraction of reference body origins below their local terrain height."""
+    if ref_ground_heights.ndim == ref_rigid_body_pos.ndim:
+        ref_ground_heights = ref_ground_heights.squeeze(-1)
+    return (ref_rigid_body_pos[..., 2] < ref_ground_heights).float().mean(-1)
+
+
 def compute_gr_rew(
     current_rigid_body_rot: Tensor,
     ref_rigid_body_rot: Tensor,
@@ -99,6 +356,52 @@ def compute_gr_rew(
     )
 
 
+def _reference_angular_reliability(
+    ref_rigid_body_ang_vel: Tensor,
+    angular_speed_soft: float,
+    angular_speed_scale: float,
+    min_reliability: float,
+) -> Tensor:
+    if angular_speed_scale <= 0.0:
+        raise ValueError("angular_speed_scale must be positive.")
+    if not 0.0 <= min_reliability <= 1.0:
+        raise ValueError("min_reliability must be in [0, 1].")
+    speed = torch.linalg.vector_norm(ref_rigid_body_ang_vel, dim=-1)
+    excess = (speed - angular_speed_soft).clamp_min(0.0)
+    confidence = torch.exp(-torch.square(excess / angular_speed_scale))
+    return min_reliability + (1.0 - min_reliability) * confidence
+
+
+def compute_reliability_weighted_gr_rew(
+    current_rigid_body_rot: Tensor,
+    ref_rigid_body_rot: Tensor,
+    ref_rigid_body_ang_vel: Tensor,
+    coefficient: float = -5.0,
+    angular_speed_soft: float = 4.0,
+    angular_speed_scale: float = 2.0,
+    min_reliability: float = 0.1,
+) -> Tensor:
+    """Robust global orientation reward for noisy video references.
+
+    Below ``angular_speed_soft`` this is exactly the standard reward. Bodies
+    whose reference angular speed is implausibly high retain only a smooth,
+    bounded fraction of their tracking weight instead of forcing a twist.
+    """
+    reliability = _reference_angular_reliability(
+        ref_rigid_body_ang_vel,
+        angular_speed_soft,
+        angular_speed_scale,
+        min_reliability,
+    )
+    error = quat_angle_diff_norm(
+        current_rigid_body_rot, ref_rigid_body_rot, w_last=True
+    )
+    weighted_error = (error * reliability).sum(-1) / reliability.sum(-1).clamp_min(
+        1e-6
+    )
+    return torch.exp(coefficient * weighted_error)
+
+
 def compute_gv_rew(
     current_rigid_body_vel: Tensor,
     ref_rigid_body_vel: Tensor,
@@ -119,6 +422,106 @@ def compute_gv_rew(
         ref_rigid_body_vel,
         coefficient,
     )
+
+
+def compute_reliability_blended_velocity_rew(
+    current_rigid_body_vel: Tensor,
+    ref_rigid_body_vel: Tensor,
+    reference_reliability: Tensor,
+    global_coefficient: float = -0.5,
+    relative_coefficient: float = -0.5,
+    minimum_absolute_weight: float = 0.05,
+    gravity_axis_only: bool = False,
+) -> Tensor:
+    """Track root translation velocity only when its observation is trusted."""
+    if not 0.0 <= minimum_absolute_weight <= 1.0:
+        raise ValueError("minimum_absolute_weight must lie in [0, 1]")
+    reliability = reference_reliability.reshape(-1).clamp(0.0, 1.0)
+    absolute_weight = minimum_absolute_weight + (
+        1.0 - minimum_absolute_weight
+    ) * reliability
+    if gravity_axis_only:
+        vertical_offset = (
+            current_rigid_body_vel[:, :1, 2:3]
+            - ref_rigid_body_vel[:, :1, 2:3]
+        ) * (1.0 - absolute_weight[:, None, None])
+        root_offset = torch.cat(
+            (
+                torch.zeros_like(vertical_offset).expand(-1, -1, 2),
+                vertical_offset,
+            ),
+            dim=-1,
+        )
+        gated_reference = ref_rigid_body_vel + root_offset
+        return mean_squared_error_exp(
+            current_rigid_body_vel,
+            gated_reference,
+            global_coefficient,
+        )
+    absolute_reward = mean_squared_error_exp(
+        current_rigid_body_vel,
+        ref_rigid_body_vel,
+        global_coefficient,
+    )
+    current_relative = current_rigid_body_vel - current_rigid_body_vel[:, :1, :]
+    reference_relative = ref_rigid_body_vel - ref_rigid_body_vel[:, :1, :]
+    relative_reward = mean_squared_error_exp(
+        current_relative,
+        reference_relative,
+        relative_coefficient,
+    )
+    return absolute_weight * absolute_reward + (
+        1.0 - absolute_weight
+    ) * relative_reward
+
+
+def compute_contact_transition_vertical_velocity_error(
+    current_rigid_body_vel: Tensor,
+    ref_rigid_body_vel: Tensor,
+    future_ref_root_vel: Tensor,
+    current_ref_contacts: Tensor,
+    future_reference_reliability: Tensor,
+    support_body_ids: Optional[List[int]] = None,
+    vertical_speed_scale: float = 3.0,
+    horizon_weights: Optional[List[float]] = None,
+    huber_delta: float = 0.5,
+    max_error: float = 5.0,
+) -> Tensor:
+    """Dense, non-saturating take-off velocity tracking error.
+
+    Generic exponential velocity rewards become nearly flat after a large
+    noisy-reference miss.  This term is active only while a reference support
+    contact precedes a reliable upward transition, and applies Smooth-L1 to
+    the *current* root vertical velocity.  It therefore supplies timing-aware
+    credit for generating support impulse without prescribing torques, adding
+    external forces, or rewarding an early jump toward a distant peak.
+    """
+    if huber_delta <= 0.0:
+        raise ValueError("huber_delta must be positive")
+    if max_error <= 0.0:
+        raise ValueError("max_error must be positive")
+    from protomotions.envs.obs.target_poses import (
+        build_contact_conditioned_takeoff_demand,
+    )
+
+    demand = build_contact_conditioned_takeoff_demand(
+        ref_rigid_body_vel,
+        future_ref_root_vel,
+        current_ref_contacts,
+        future_reference_reliability,
+        support_body_ids,
+        vertical_speed_scale,
+        horizon_weights,
+    )[:, 0]
+    velocity_error = (
+        current_rigid_body_vel[:, 0, 2] - ref_rigid_body_vel[:, 0, 2]
+    ).abs()
+    smooth_l1 = torch.where(
+        velocity_error < huber_delta,
+        0.5 * velocity_error.square() / huber_delta,
+        velocity_error - 0.5 * huber_delta,
+    )
+    return demand * smooth_l1.clamp(max=max_error)
 
 
 def compute_gav_rew(
@@ -375,6 +778,44 @@ def compute_relative_body_ori_rew(
     )
 
 
+def compute_reliability_weighted_relative_body_ori_rew(
+    current_rigid_body_rot: Tensor,
+    ref_rigid_body_rot: Tensor,
+    ref_rigid_body_ang_vel: Tensor,
+    current_anchor_rot: Tensor,
+    anchor_idx: int,
+    sigma: float = 0.4,
+    angular_speed_soft: float = 4.0,
+    angular_speed_scale: float = 2.0,
+    min_reliability: float = 0.1,
+) -> Tensor:
+    """Heading-relative orientation reward with body-wise reliability."""
+    ref_anchor_rot = ref_rigid_body_rot[:, anchor_idx, :]
+    current_heading_inv = calc_heading_quat_inv(current_anchor_rot, w_last=True)
+    ref_heading_inv = calc_heading_quat_inv(ref_anchor_rot, w_last=True)
+    current_rel_rot = quat_mul(
+        current_heading_inv[:, None, :].expand_as(current_rigid_body_rot),
+        current_rigid_body_rot,
+        w_last=True,
+    )
+    ref_rel_rot = quat_mul(
+        ref_heading_inv[:, None, :].expand_as(ref_rigid_body_rot),
+        ref_rigid_body_rot,
+        w_last=True,
+    )
+    reliability = _reference_angular_reliability(
+        ref_rigid_body_ang_vel,
+        angular_speed_soft,
+        angular_speed_scale,
+        min_reliability,
+    )
+    error = quat_angle_diff_norm(current_rel_rot, ref_rel_rot, w_last=True)
+    weighted_error = (error * reliability).sum(-1) / reliability.sum(-1).clamp_min(
+        1e-6
+    )
+    return torch.exp(-weighted_error / (sigma**2))
+
+
 def compute_global_body_lin_vel_rew(
     current_rigid_body_vel: Tensor,
     ref_rigid_body_vel: Tensor,
@@ -416,8 +857,13 @@ def compute_global_body_ang_vel_rew(
 __all__ = [
     # Standard tracking rewards
     "compute_gt_rew",
+    "compute_reliability_blended_position_rew",
+    "compute_terrain_feasible_gt_rew",
+    "compute_reference_penetration_depth",
+    "compute_reference_penetration_fraction",
     "compute_gr_rew",
     "compute_gv_rew",
+    "compute_reliability_blended_velocity_rew",
     "compute_gav_rew",
     "compute_rh_rew",
     # BeyondMimic-style rewards

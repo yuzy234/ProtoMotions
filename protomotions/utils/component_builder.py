@@ -38,6 +38,11 @@ def build_terrain_from_config(terrain_config, num_envs: int, device: torch.devic
     if terrain_config is None:
         return None
 
+    if getattr(terrain_config, "mesh_path", None):
+        from protomotions.components.terrains.mesh_terrain import MeshTerrain
+
+        return MeshTerrain(config=terrain_config, num_envs=num_envs, device=device)
+
     from protomotions.components.terrains.terrain import Terrain
 
     return Terrain(config=terrain_config, num_envs=num_envs, device=device)

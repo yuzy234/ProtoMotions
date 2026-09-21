@@ -51,8 +51,12 @@ from protomotions.envs.obs.humanoid_historical import (
 
 # Target pose building compute kernels
 from protomotions.envs.obs.target_poses import (
+    build_contact_conditioned_takeoff_demand,
+    build_reference_reliability,
     build_max_coords_target_poses_future_rel,
+    build_reliability_gated_max_coords_target_poses_future_rel,
     build_max_coords_target_poses,
+    build_reliability_gated_max_coords_target_poses,
     build_reduced_coords_target_poses,
     build_deploy_target_poses,
     build_sparse_target_poses,
@@ -88,6 +92,11 @@ def to_float(x):
     return x.float()
 
 
+def scalar_to_column(x):
+    """Convert a per-environment scalar into a one-feature observation."""
+    return x.unsqueeze(-1) if x.ndim == 1 else x
+
+
 __all__ = [
     # Humanoid observation compute kernels
     "dof_to_local",
@@ -95,6 +104,7 @@ __all__ = [
     "obs_to_dof",
     "root_projected_gravity",
     "compute_local_ang_vel",
+    "scalar_to_column",
     "compute_humanoid_reduced_coords_observations",
     "compute_humanoid_max_coords_observations",
     # Humanoid historical observation compute kernels
@@ -106,8 +116,12 @@ __all__ = [
     "compute_historical_poses_with_time_reduced_coords",
     "compute_historical_max_coords_from_motion_lib",
     # Target pose building compute kernels
+    "build_contact_conditioned_takeoff_demand",
+    "build_reference_reliability",
     "build_max_coords_target_poses_future_rel",
+    "build_reliability_gated_max_coords_target_poses_future_rel",
     "build_max_coords_target_poses",
+    "build_reliability_gated_max_coords_target_poses",
     "build_reduced_coords_target_poses",
     "build_deploy_target_poses",
     "build_sparse_target_poses",

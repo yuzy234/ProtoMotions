@@ -113,6 +113,8 @@ class BaseAgent:
         self.num_mini_epochs: int = self.config.num_mini_epochs
         self.gamma: float = self.config.gamma
         self._should_stop: bool = False
+        self._early_stop_best_score: Optional[float] = None
+        self._early_stop_bad_evals: int = 0
         self.max_epochs: int = (
             self.config.training_max_steps
             // self.fabric.world_size
@@ -329,6 +331,9 @@ class BaseAgent:
             log.info(
                 f"Saved env checkpoint: {env_checkpoint}, rank {self.fabric.global_rank}"
             )
+            motion_manager = getattr(self.env, "motion_manager", None)
+            if motion_manager is not None and hasattr(motion_manager, "save_clip_statistics"):
+                motion_manager.save_clip_statistics(save_dir / "clip_statistics.json")
         self.fabric.barrier()
 
         # Check if new high score flag is consistent across devices
@@ -472,10 +477,78 @@ class BaseAgent:
                     actor_output = self.collect_rollout_step(obs_td, step)
                     self.check_for_nans(obs_td, actor_output)
 
+                    if "root_pos_residual_scaled" in actor_output and hasattr(
+                        self.env, "set_reference_root_residual"
+                    ):
+                        self.env.set_reference_root_residual(
+                            actor_output["root_pos_residual_scaled"]
+                        )
+
                     next_obs, rewards, dones, terminated, extras = self.env.step(actor_output["action"])
                     assert torch.all(
                         torch.isfinite(rewards)
                     ), f"NaN or Inf in rewards: {rewards}"
+
+                    if "residual_action_raw" in actor_output:
+                        residual = actor_output["residual_action_raw"]
+                        extras["residual/raw_norm_mean"] = torch.linalg.vector_norm(
+                            residual, dim=-1
+                        )
+                        extras["residual/raw_abs_mean"] = residual.abs().mean(dim=-1)
+                        if hasattr(self.actor, "_effective_std"):
+                            extras["residual/effective_std_mean"] = (
+                                self.actor._effective_std().mean().detach()
+                            )
+                    if "residual_action_mean" in actor_output:
+                        residual_mean = actor_output["residual_action_mean"]
+                        extras["residual/mean_norm_mean"] = torch.linalg.vector_norm(
+                            residual_mean, dim=-1
+                        )
+                        extras["residual/mean_abs_mean"] = residual_mean.abs().mean(dim=-1)
+                    if "effective_std_mean" in actor_output:
+                        extras["residual/effective_std_mean"] = actor_output[
+                            "effective_std_mean"
+                        ]
+                    if "exploration_demand_metric" in actor_output:
+                        extras["residual/exploration_demand"] = actor_output[
+                            "exploration_demand_metric"
+                        ]
+                    if "demand_action_residual_rms" in actor_output:
+                        extras["residual/demand_action_residual_rms"] = actor_output[
+                            "demand_action_residual_rms"
+                        ]
+                    if "latent_residual_raw" in actor_output:
+                        latent_residual_raw = actor_output["latent_residual_raw"]
+                        extras["residual/latent_raw_norm_mean"] = (
+                            torch.linalg.vector_norm(latent_residual_raw, dim=-1)
+                        )
+                        extras["residual/latent_raw_abs_mean"] = (
+                            latent_residual_raw.abs().mean(dim=-1)
+                        )
+                    if "latent_residual_mean" in actor_output:
+                        latent_residual = actor_output["latent_residual_mean"]
+                        extras["residual/latent_norm_mean"] = (
+                            torch.linalg.vector_norm(latent_residual, dim=-1)
+                        )
+                        extras["residual/latent_abs_mean"] = (
+                            latent_residual.abs().mean(dim=-1)
+                        )
+                    if "layer_adapter_delta_rms" in actor_output:
+                        extras["residual/layer_adapter_delta_rms"] = actor_output[
+                            "layer_adapter_delta_rms"
+                        ]
+                    if "context_adapter_delta_rms" in actor_output:
+                        extras["residual/context_adapter_delta_rms"] = actor_output[
+                            "context_adapter_delta_rms"
+                        ]
+                    if "action_context_residual_rms" in actor_output:
+                        extras["residual/action_context_residual_rms"] = actor_output[
+                            "action_context_residual_rms"
+                        ]
+                    if "reference_reliability_metric" in actor_output:
+                        extras["reference/reliability"] = actor_output[
+                            "reference_reliability_metric"
+                        ]
 
                     next_obs = self.add_agent_info_to_obs(next_obs)
                     next_obs_td = self.obs_dict_to_tensordict(next_obs)
@@ -484,6 +557,16 @@ class BaseAgent:
                     dones, terminated, extras = self.post_env_step_modifications(
                         dones, terminated, extras
                     )
+
+                    # Attribute the final post-processed termination outcome to
+                    # the clip that was active for the just-finished episode.
+                    motion_manager = getattr(self.env, "motion_manager", None)
+                    if motion_manager is not None and hasattr(
+                        motion_manager, "record_episode_outcomes"
+                    ):
+                        extras.update(
+                            motion_manager.record_episode_outcomes(dones, terminated)
+                        )
                     done_indices = dones.nonzero(as_tuple=False).squeeze(-1)
 
                     # Record metrics and store data from this rollout step
@@ -541,6 +624,9 @@ class BaseAgent:
             ):
                 self.fabric.call("on_eval_start", self)
 
+                is_first_eval_after_checkpoint_load = (
+                    self.just_loaded_checkpoint_should_evaluate
+                )
                 eval_log_dict, evaluated_score = self.evaluator.evaluate()
                 evaluated_score = self.fabric.broadcast(evaluated_score, src=0)
                 self.fabric.call("on_eval_end", self)
@@ -552,7 +638,17 @@ class BaseAgent:
                     ):
                         self.best_evaluated_score = evaluated_score
                         self.save(checkpoint_name="last.ckpt", new_high_score=True)
+                self._update_metric_early_stopping(eval_log_dict, evaluated_score)
                 training_log_dict.update(eval_log_dict)
+                # A warm-started adaptation can peak immediately (for example,
+                # epoch 41 after loading epoch 40).  Periodic checkpointing at
+                # multiples of 10 would otherwise make that policy impossible
+                # to cold-evaluate or select later.
+                if (
+                    is_first_eval_after_checkpoint_load
+                    and self.config.save_epoch_checkpoint_every is not None
+                ):
+                    self.save(checkpoint_name=f"epoch_{self.current_epoch}.ckpt")
                 self.just_loaded_checkpoint_should_evaluate = False
 
                 # Skip next policy update to avoid training spikes after eval (hacky fix)
@@ -841,6 +937,55 @@ class BaseAgent:
         after the current epoch completes.
         """
         self._should_stop = True
+
+    def _update_metric_early_stopping(
+        self,
+        eval_log_dict: Dict,
+        evaluated_score: Optional[float],
+    ) -> None:
+        """Stop on a deployment-quality plateau after tracking is successful."""
+        patience = self.config.early_stop_patience_evals
+        min_epoch = self.config.early_stop_min_epochs
+        if patience is None or min_epoch is None or evaluated_score is None:
+            return
+        success_rate = eval_log_dict.get("eval/success_rate")
+        force_after = self.config.early_stop_force_after_epochs
+        success_eligible = (
+            success_rate is not None
+            and float(success_rate) >= self.config.early_stop_min_success_rate
+        )
+        failure_timeout_eligible = (
+            force_after is not None and self.current_epoch >= int(force_after)
+        )
+        if (
+            self.current_epoch < min_epoch
+            or success_rate is None
+            or not (success_eligible or failure_timeout_eligible)
+        ):
+            return
+        score = float(evaluated_score)
+        min_delta = float(self.config.early_stop_min_delta)
+        if (
+            self._early_stop_best_score is None
+            or score > self._early_stop_best_score + min_delta
+        ):
+            self._early_stop_best_score = score
+            self._early_stop_bad_evals = 0
+        else:
+            self._early_stop_bad_evals += 1
+        eval_log_dict["early_stop/bad_evals"] = self._early_stop_bad_evals
+        eval_log_dict["early_stop/best_score"] = self._early_stop_best_score
+        if self._early_stop_bad_evals >= int(patience):
+            log.info(
+                "Early stopping at epoch %d: score failed to improve by %.6g "
+                "for %d eligible evaluations (best %.6f, success %.4f).",
+                self.current_epoch,
+                min_delta,
+                self._early_stop_bad_evals,
+                self._early_stop_best_score,
+                float(success_rate),
+            )
+            self.terminate_early()
 
     @torch.no_grad()
     def process_dataset(self, dataset):

@@ -85,6 +85,91 @@ def create_parser():
         help="Run full evaluation instead of simple inference",
     )
     parser.add_argument(
+        "--one-step-reference-eval",
+        action="store_true",
+        default=False,
+        help=(
+            "Reset parallel environments to evenly spaced reference times, execute one "
+            "deterministic policy/physics step, and save r+gamma*V(s')."
+        ),
+    )
+    parser.add_argument(
+        "--root-reference-cem",
+        action="store_true",
+        default=False,
+        help=(
+            "Search a low-frequency vertical root correction with one closed-loop "
+            "physics rollout per parallel environment."
+        ),
+    )
+    parser.add_argument(
+        "--root-cem-prior-motion",
+        type=str,
+        default=None,
+        help="Optional MotionLib carrying root_reference_reliability and an initial correction.",
+    )
+    parser.add_argument("--root-cem-iterations", type=int, default=12)
+    parser.add_argument("--root-cem-knots", type=int, default=8)
+    parser.add_argument("--root-cem-elite-fraction", type=float, default=0.10)
+    parser.add_argument("--root-cem-initial-std", type=float, default=0.12)
+    parser.add_argument("--root-cem-minimum-std", type=float, default=0.005)
+    parser.add_argument(
+        "--root-cem-minimum-correction",
+        type=float,
+        default=-0.60,
+        help="Minimum vertical root correction searched by CEM, in metres.",
+    )
+    parser.add_argument(
+        "--root-cem-maximum-correction",
+        type=float,
+        default=0.60,
+        help="Maximum vertical root correction searched by CEM, in metres.",
+    )
+    parser.add_argument("--root-cem-seed", type=int, default=20260918)
+    parser.add_argument(
+        "--one-step-start-fraction",
+        type=float,
+        default=0.0,
+        help="First normalized motion time used by --one-step-reference-eval.",
+    )
+    parser.add_argument(
+        "--one-step-end-fraction",
+        type=float,
+        default=1.0,
+        help="Last normalized motion time used by --one-step-reference-eval.",
+    )
+    parser.add_argument(
+        "--one-step-warmup-steps",
+        type=int,
+        default=1,
+        help=(
+            "Short settling horizon held at each reference time before the measured step; "
+            "one step is required for Isaac Gym forward kinematics after an indexed reset."
+        ),
+    )
+    parser.add_argument(
+        "--critic-bootstrap-horizon-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of measured physics steps in the bootstrapped return. One preserves "
+            "the original one-step metric; small values such as 4 or 8 capture short-term "
+            "contact propagation without a complete rollout."
+        ),
+    )
+    parser.add_argument(
+        "--loop-motion",
+        action="store_true",
+        default=False,
+        help="Loop one fixed motion forever without random resampling.",
+    )
+    parser.add_argument(
+        "--motion-id",
+        type=int,
+        default=0,
+        help="Motion ID to replay when --loop-motion is enabled.",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         default=False,
@@ -110,6 +195,74 @@ def create_parser():
         "--scenes-file", type=str, default=None, help="Path to scenes file (optional)"
     )
     parser.add_argument(
+        "--terrain-mesh",
+        type=str,
+        default=None,
+        help="External world-space PLY/OBJ triangle mesh terrain.",
+    )
+    parser.add_argument(
+        "--control-armature",
+        type=float,
+        default=None,
+        help="Override every configured robot joint armature for deployment ablations.",
+    )
+    parser.add_argument(
+        "--preserve-reference-world-position",
+        action="store_true",
+        help="Do not move reference motion to a sampled terrain location.",
+    )
+    parser.add_argument(
+        "--masked-mimic-full-conditioning",
+        action="store_true",
+        help="Use every checkpoint-supported MaskedMimic body with translation and rotation visible.",
+    )
+    parser.add_argument(
+        "--smpl-shape-from-motion",
+        action="store_true",
+        help="For SMPL checkpoints, load/generate a CRISP/SMPLSim humanoid asset from motion_betas[motion_id].",
+    )
+    parser.add_argument(
+        "--shape-asset-dir",
+        type=str,
+        default="data/easymimic/assets/mjcf",
+        help="Directory for generated per-shape SMPL MJCF assets.",
+    )
+    parser.add_argument(
+        "--smpl-data-dir",
+        type=str,
+        default=None,
+        help="Directory containing SMPL model PKLs for --smpl-shape-from-motion.",
+    )
+    parser.add_argument(
+        "--disable-action-residual",
+        "--disable-residual",
+        action="store_true",
+        default=False,
+        help="For ablation, force a configured action- or latent-residual actor to output zero residual.",
+    )
+    parser.add_argument(
+        "--save-predicted-motion-lib",
+        action="store_true",
+        default=False,
+        help="During --full-eval, save the simulated trajectory as a packaged MotionLib.",
+    )
+    parser.add_argument(
+        "--disable-reference-contact-rewards",
+        action="store_true",
+        default=False,
+        help=(
+            "Inference/evaluation only: remove reward components that require reference "
+            "contact labels. Use for transferred clips whose packaged contacts are absent "
+            "or all zero; policy observations and reported tracking metrics are unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Write evaluation artifacts here instead of beside the checkpoint.",
+    )
+    parser.add_argument(
         "--overrides",
         nargs="*",
         default=[],
@@ -133,13 +286,204 @@ AppLauncher = import_simulator_before_torch(args.simulator)
 
 # Now safe to import everything else including torch
 import logging  # noqa: E402
+import json  # noqa: E402
 from pathlib import Path  # noqa: E402
 import torch  # noqa: E402
 from protomotions.utils.hydra_replacement import get_class  # noqa: E402
 from protomotions.utils.fabric_config import FabricConfig  # noqa: E402
 from lightning.fabric import Fabric  # noqa: E402
 from dataclasses import asdict  # noqa: E402
-from protomotions.utils.config_utils import clean_dict_for_storage  # noqa: E402
+
+
+def apply_smpl_shape_from_motion(robot_config, motion_file: str, motion_id: int) -> str:
+    """Configure inference robot from the fixed motion's SMPL shape."""
+    from protomotions.utils.smpl_shape import configure_robot_from_motion_shape
+
+    return configure_robot_from_motion_shape(
+        robot_config=robot_config,
+        motion_file=motion_file,
+        motion_id=motion_id,
+        shape_asset_dir=args.shape_asset_dir,
+        smpl_data_dir=args.smpl_data_dir,
+        preserve_control_info=True,
+    )
+
+
+def packaged_motion_count(motion_file: str) -> int:
+    """Return the number of clips in a packaged MotionLib without constructing an env."""
+    packaged = torch.load(motion_file, map_location="cpu", weights_only=False)
+    if not isinstance(packaged, dict) or "motion_num_frames" not in packaged:
+        raise ValueError(
+            "--smpl-shape-from-motion with --full-eval requires a packaged "
+            "MotionLib containing motion_num_frames."
+        )
+    return int(torch.as_tensor(packaged["motion_num_frames"]).numel())
+
+
+def run_one_step_reference_evaluation(agent, env, output_dir: Path) -> dict:
+    """Evaluate a short deterministic physics return bootstrapped by the critic."""
+    if env.motion_lib.num_motions() != 1:
+        raise ValueError("One-step reference evaluation currently requires one motion.")
+    if not 0.0 <= args.one_step_start_fraction < args.one_step_end_fraction <= 1.0:
+        raise ValueError("Expected 0 <= one-step start < end <= 1.")
+    if args.one_step_warmup_steps < 1:
+        raise ValueError(
+            "Isaac Gym one-step evaluation requires at least one warmup step."
+        )
+    if args.critic_bootstrap_horizon_steps < 1:
+        raise ValueError("critic bootstrap horizon must be at least one step")
+    if hasattr(env.motion_manager, "set_clip_mode"):
+        env.motion_manager.set_clip_mode(False)
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    motion_ids = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    motion_length = env.motion_lib.get_motion_length(
+        torch.zeros(1, device=env.device, dtype=torch.long)
+    )[0]
+    latest_time = torch.clamp(motion_length - env.dt, min=0.0)
+    sample_times = (
+        torch.linspace(
+            float(args.one_step_start_fraction),
+            float(args.one_step_end_fraction),
+            env.num_envs,
+            device=env.device,
+        )
+        * latest_time
+    )
+    env.motion_manager.motion_ids[env_ids] = motion_ids
+    env.motion_manager.motion_times[env_ids] = sample_times
+    observations, _ = env.reset(env_ids, disable_motion_resample=True)
+    observations = agent.add_agent_info_to_obs(observations)
+    observation_td = agent.obs_dict_to_tensordict(observations)
+    with torch.inference_mode():
+        for _ in range(args.one_step_warmup_steps):
+            warmup_output = agent.model(observation_td)
+            warmup_action = warmup_output.get(
+                "mean_action", warmup_output.get("action")
+            )
+            observations, _, _, _, _ = env.step(warmup_action)
+            env.motion_manager.motion_times[env_ids] = sample_times
+            env._current_context = None
+            env.compute_observations(context=env.context)
+            observations = agent.add_agent_info_to_obs(env.get_obs())
+            observation_td = agent.obs_dict_to_tensordict(observations)
+        current_state = env.simulator.get_robot_state().clone()
+        current_output = agent.model(observation_td)
+        current_value = current_output["value"].reshape(env.num_envs)
+        discounted_rewards = torch.zeros(env.num_envs, device=env.device)
+        active = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        any_done = torch.zeros_like(active)
+        any_terminated = torch.zeros_like(active)
+        actions = []
+        step_rewards = []
+        discount = 1.0
+        extras = {}
+        for step in range(args.critic_bootstrap_horizon_steps):
+            output = current_output if step == 0 else agent.model(observation_td)
+            action = output.get("mean_action", output.get("action"))
+            actions.append(action)
+            if "root_pos_residual_scaled" in output and hasattr(
+                env, "set_reference_root_residual"
+            ):
+                env.set_reference_root_residual(output["root_pos_residual_scaled"])
+            next_observations, rewards, dones, terminated, extras = env.step(action)
+            rewards = rewards.reshape(env.num_envs)
+            dones = dones.reshape(env.num_envs)
+            terminated = terminated.reshape(env.num_envs)
+            step_rewards.append(rewards)
+            discounted_rewards += discount * rewards * active.float()
+            any_done |= dones
+            any_terminated |= terminated
+            active &= ~terminated
+            discount *= agent.gamma
+            next_observations = agent.add_agent_info_to_obs(next_observations)
+            observation_td = agent.obs_dict_to_tensordict(next_observations)
+        next_value = agent.model(observation_td)["value"].reshape(env.num_envs)
+    td_proxy = discounted_rewards + discount * next_value * active.float()
+    action_sequence = torch.stack(actions, dim=1)
+    reward_sequence = torch.stack(step_rewards, dim=1)
+    action = action_sequence[:, 0]
+    rewards = discounted_rewards
+    dones = any_done
+    terminated = any_terminated
+    next_state = env.simulator.get_robot_state()
+    root_position_change = torch.linalg.vector_norm(
+        next_state.root_pos - current_state.root_pos, dim=-1
+    )
+    root_velocity_change = torch.linalg.vector_norm(
+        next_state.root_vel - current_state.root_vel, dim=-1
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "one_step_reference_eval.pt"
+    torch.save(
+        {
+            "motion_ids": motion_ids.detach().cpu(),
+            "motion_times": sample_times.detach().cpu(),
+            "current_value": current_value.detach().cpu(),
+            "action": action.detach().cpu(),
+            "action_sequence": action_sequence.detach().cpu(),
+            "reward": rewards.detach().cpu(),
+            "reward_sequence": reward_sequence.detach().cpu(),
+            "next_value": next_value.detach().cpu(),
+            "td_proxy": td_proxy.detach().cpu(),
+            "td_residual": (td_proxy - current_value).detach().cpu(),
+            "done": dones.detach().cpu(),
+            "terminated": terminated.detach().cpu(),
+            "root_position_change_m": root_position_change.detach().cpu(),
+            "root_velocity_change_mps": root_velocity_change.detach().cpu(),
+            "current_root_position": current_state.root_pos.detach().cpu(),
+            "next_root_position": next_state.root_pos.detach().cpu(),
+            "current_root_velocity": current_state.root_vel.detach().cpu(),
+            "next_root_velocity": next_state.root_vel.detach().cpu(),
+            "contact_force": next_state.rigid_body_contact_forces.detach().cpu(),
+            "raw_next_state": {
+                key[len("raw/") :]: value.detach().cpu()
+                for key, value in extras.items()
+                if key.startswith("raw/") and isinstance(value, torch.Tensor)
+            },
+        },
+        output_path,
+    )
+
+    def statistics(values: torch.Tensor) -> dict:
+        values = values.detach().float().cpu()
+        return {
+            "mean": float(values.mean()),
+            "p05": float(torch.quantile(values, 0.05)),
+            "p50": float(torch.quantile(values, 0.50)),
+            "p95": float(torch.quantile(values, 0.95)),
+            "min": float(values.min()),
+            "max": float(values.max()),
+        }
+
+    summary = {
+        "method": "parallel reference-state short-horizon physics/critic evaluation",
+        "definition": "B_H=sum(k=0..H-1) gamma^k*r_k + gamma^H*V(s_H)",
+        "samples": int(env.num_envs),
+        "motion_length_s": float(motion_length),
+        "time_fraction": [
+            float(args.one_step_start_fraction),
+            float(args.one_step_end_fraction),
+        ],
+        "gamma": float(agent.gamma),
+        "critic_bootstrap_horizon_steps": int(args.critic_bootstrap_horizon_steps),
+        "warmup_steps": int(args.one_step_warmup_steps),
+        "safe_reference_reset": bool(env.config.safe_reference_reset),
+        "current_value": statistics(current_value),
+        "reward": statistics(rewards),
+        "next_value": statistics(next_value),
+        "td_proxy": statistics(td_proxy),
+        "td_residual": statistics(td_proxy - current_value),
+        "root_position_change_m": statistics(root_position_change),
+        "root_velocity_change_mps": statistics(root_velocity_change),
+        "termination_fraction": float(terminated.float().mean()),
+        "output": str(output_path),
+    }
+    summary_path = output_dir / "one_step_reference_eval_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2), flush=True)
+    return summary
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
@@ -184,14 +528,33 @@ def main():
     # Re-use the parser and args from module level
     global parser, args
     args = parser.parse_args()
+    if args.full_eval and args.loop_motion:
+        parser.error("--full-eval and --loop-motion are mutually exclusive")
+    if args.full_eval and args.one_step_reference_eval:
+        parser.error("--full-eval and --one-step-reference-eval are mutually exclusive")
+    selected_batch_modes = sum(
+        bool(value)
+        for value in (
+            args.full_eval,
+            args.one_step_reference_eval,
+            args.root_reference_cem,
+        )
+    )
+    if selected_batch_modes > 1:
+        parser.error(
+            "--full-eval, --one-step-reference-eval and --root-reference-cem "
+            "are mutually exclusive"
+        )
+    if args.root_reference_cem and args.motion_file is None:
+        parser.error("--root-reference-cem requires --motion-file")
 
     checkpoint = Path(args.checkpoint)
 
     # Load frozen configs from resolved_configs.pt (exact reproducibility)
     resolved_configs_path = checkpoint.parent / "resolved_configs_inference.pt"
-    assert (
-        resolved_configs_path.exists()
-    ), f"Could not find resolved configs at {resolved_configs_path}"
+    assert resolved_configs_path.exists(), (
+        f"Could not find resolved configs at {resolved_configs_path}"
+    )
 
     log.info(f"Loading resolved configs from {resolved_configs_path}")
     resolved_configs = torch.load(
@@ -253,6 +616,76 @@ def main():
         log.info(f"CLI override: headless = {args.headless}")
         simulator_config.headless = args.headless
 
+    if args.terrain_mesh is not None:
+        log.info(f"CLI override: external terrain mesh = {args.terrain_mesh}")
+        terrain_config.mesh_path = str(Path(args.terrain_mesh).expanduser().resolve())
+
+    if args.control_armature is not None:
+        for control_info in robot_config.control.control_info.values():
+            control_info.armature = float(args.control_armature)
+        log.info(
+            "CLI override: all joint armatures = %s", args.control_armature
+        )
+
+    if args.preserve_reference_world_position:
+        log.info("CLI override: preserving reference motion world position")
+        env_config.preserve_reference_world_position = True
+        env_config.ref_respawn_offset = 0.0
+
+    if args.masked_mimic_full_conditioning:
+        masked_cfg = env_config.control_components.get("masked_mimic")
+        if masked_cfg is None:
+            raise ValueError(
+                "--masked-mimic-full-conditioning requires a MaskedMimic checkpoint"
+            )
+        log.info("CLI override: deterministic full MaskedMimic conditioning")
+        masked_cfg.deterministic_full_body_conditioning = True
+
+    if args.smpl_shape_from_motion:
+        if args.full_eval and packaged_motion_count(motion_lib_config.motion_file) != 1:
+            raise ValueError(
+                "--smpl-shape-from-motion with --full-eval requires exactly one motion. "
+                "A single IsaacGym simulation can only use one humanoid asset."
+            )
+        selected_asset = apply_smpl_shape_from_motion(
+            robot_config=robot_config,
+            motion_file=motion_lib_config.motion_file,
+            motion_id=args.motion_id,
+        )
+        log.info(
+            f"CLI override: using SMPL shape asset for motion_id={args.motion_id}: {selected_asset}"
+        )
+
+    if args.disable_action_residual:
+        actor_cfg = getattr(agent_config.model, "actor", None)
+        if not hasattr(actor_cfg, "disable_residual"):
+            raise ValueError(
+                "--disable-residual requires a residual-adapter checkpoint."
+            )
+        actor_cfg.disable_residual = True
+        log.info("CLI ablation: residual adapter forced to zero")
+
+    if args.save_predicted_motion_lib:
+        if not args.full_eval:
+            raise ValueError("--save-predicted-motion-lib requires --full-eval.")
+        if not hasattr(agent_config.evaluator, "save_predicted_motion_lib_every"):
+            raise ValueError(
+                "The configured evaluator cannot save a predicted MotionLib."
+            )
+        agent_config.evaluator.save_predicted_motion_lib_every = 1
+        log.info("CLI override: save predicted MotionLib after this evaluation")
+
+    if args.disable_reference_contact_rewards:
+        removed = []
+        for name in ("contact_match_rew",):
+            if name in env_config.reward_components:
+                env_config.reward_components.pop(name)
+                removed.append(name)
+        log.info(
+            "CLI evaluation override: disabled reference-contact rewards: "
+            + (", ".join(removed) if removed else "none configured")
+        )
+
     # Parse and apply general CLI overrides
     from protomotions.utils.config_utils import (
         parse_cli_overrides,
@@ -294,7 +727,9 @@ def main():
         simulator_extra_params["simulation_app"] = app_launcher.app
 
     # Convert friction for simulator compatibility
-    from protomotions.simulator.base_simulator.utils import convert_friction_for_simulator
+    from protomotions.simulator.base_simulator.utils import (
+        convert_friction_for_simulator,
+    )
 
     terrain_config, simulator_config = convert_friction_for_simulator(
         terrain_config, simulator_config
@@ -341,7 +776,11 @@ def main():
     # Determine root_dir for agent based on checkpoint path
     agent_kwargs = {}
     checkpoint_path = Path(args.checkpoint)
-    agent_kwargs["root_dir"] = checkpoint_path.parent
+    agent_kwargs["root_dir"] = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir is not None
+        else checkpoint_path.parent
+    )
 
     # Create agent
     from protomotions.agents.base_agent.agent import BaseAgent
@@ -367,7 +806,7 @@ def main():
         if args.full_eval:
             agent.evaluator.eval_count = 0
             evaluation_log, evaluated_score = agent.evaluator.evaluate()
-            
+
             # Print evaluation metrics
             print("\n" + "=" * 60)
             print("EVALUATION RESULTS")
@@ -378,8 +817,51 @@ def main():
             if evaluated_score is not None:
                 print(f"  Overall Score: {evaluated_score:.6f}")
             print("=" * 60 + "\n")
+            metrics_path = Path(agent_kwargs["root_dir"]) / "evaluation_metrics.json"
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics = {key: float(value) for key, value in evaluation_log.items()}
+            metrics["overall_score"] = (
+                None if evaluated_score is None else float(evaluated_score)
+            )
+            metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+            log.info(f"Evaluation metrics saved to {metrics_path}")
+        elif args.one_step_reference_eval:
+            run_one_step_reference_evaluation(
+                agent,
+                env,
+                Path(agent_kwargs["root_dir"]),
+            )
+        elif args.root_reference_cem:
+            from protomotions.utils.root_reference_cem import (
+                RootReferenceCEMConfig,
+                run_root_reference_cem,
+            )
+
+            run_root_reference_cem(
+                agent=agent,
+                env=env,
+                source_motion_path=Path(args.motion_file),
+                output_dir=Path(agent_kwargs["root_dir"]),
+                config=RootReferenceCEMConfig(
+                    iterations=args.root_cem_iterations,
+                    knots=args.root_cem_knots,
+                    elite_fraction=args.root_cem_elite_fraction,
+                    initial_std_m=args.root_cem_initial_std,
+                    minimum_std_m=args.root_cem_minimum_std,
+                    minimum_correction_m=args.root_cem_minimum_correction,
+                    maximum_correction_m=args.root_cem_maximum_correction,
+                    seed=args.root_cem_seed,
+                ),
+                prior_motion_path=None
+                if args.root_cem_prior_motion is None
+                else Path(args.root_cem_prior_motion),
+            )
         else:
-            agent.evaluator.simple_test_policy(collect_metrics=True)
+            agent.evaluator.simple_test_policy(
+                collect_metrics=True,
+                loop_motion=args.loop_motion,
+                motion_id=args.motion_id,
+            )
     finally:
         # Ensure simulator viewer is properly closed (prevents hangs)
         if hasattr(env.simulator, "shutdown"):

@@ -279,6 +279,11 @@ class MimicContext:
     future_dof_vel: Tensor = FieldPath()
     anchor_idx: int = FieldPath()
     ref_lr: Tensor = FieldPath()
+    ref_ground_heights: Tensor = FieldPath()
+    safe_reset_reward_lift: Tensor = FieldPath()
+    reset_transition_progress: Tensor = FieldPath()
+    reference_reliability: Tensor = FieldPath()
+    future_reference_reliability: Tensor = FieldPath()
 
     # Future root properties (precomputed)
     future_root_pos: Tensor = FieldPath()
@@ -306,6 +311,11 @@ class MimicContext:
         future_dof_vel: Tensor,
         anchor_idx: int,
         ref_lr: Tensor,
+        ref_ground_heights: Tensor,
+        safe_reset_reward_lift: Tensor,
+        reset_transition_progress: Tensor,
+        reference_reliability: Tensor,
+        future_reference_reliability: Tensor,
     ):
         """Initialize MimicContext with precomputed derived values.
 
@@ -319,6 +329,13 @@ class MimicContext:
             future_dof_vel: Future DOF velocities [num_envs, future_steps, num_dofs].
             anchor_idx: Index of anchor body for computing anchor-relative values.
             ref_lr: Reference DOF in local rotation format for DOF tracking rewards.
+            ref_ground_heights: Terrain height below every reference body [num_envs, num_bodies].
+            safe_reset_reward_lift: Smoothly decaying reset lift [num_envs].
+            reset_transition_progress: Smooth reset progress from 0 to 1 [num_envs].
+            reference_reliability: Physical confidence in absolute root motion
+                for the current frame [num_envs].
+            future_reference_reliability: Confidence at every command horizon
+                used by temporal side paths [num_envs, future_steps].
         """
         # Store direct values
         self.ref_state = ref_state
@@ -330,6 +347,11 @@ class MimicContext:
         self.future_dof_vel = future_dof_vel
         self.anchor_idx = anchor_idx
         self.ref_lr = ref_lr
+        self.ref_ground_heights = ref_ground_heights
+        self.safe_reset_reward_lift = safe_reset_reward_lift
+        self.reset_transition_progress = reset_transition_progress
+        self.reference_reliability = reference_reliability
+        self.future_reference_reliability = future_reference_reliability
 
         # Precompute future root properties
         self.future_root_pos = future_pos[:, :, 0, :]
@@ -526,6 +548,7 @@ class EnvContext:
     body_contacts: Optional[Tensor] = FieldPath()
     current_contact_force_magnitudes: Optional[Tensor] = FieldPath()
     prev_contact_force_magnitudes: Optional[Tensor] = FieldPath()
+    episode_progress: Optional[Tensor] = FieldPath()
     dt: float = FieldPath()
 
     # Contact tracking
@@ -552,6 +575,7 @@ class EnvContext:
         body_contacts: Optional[Tensor] = None,
         current_contact_force_magnitudes: Optional[Tensor] = None,
         prev_contact_force_magnitudes: Optional[Tensor] = None,
+        episode_progress: Optional[Tensor] = None,
         contact_body_ids: Optional[Tensor] = None,
         mimic: Optional[MimicContext] = None,
         masked_mimic: Optional[MaskedMimicContext] = None,
@@ -600,6 +624,7 @@ class EnvContext:
         self.body_contacts = body_contacts
         self.current_contact_force_magnitudes = current_contact_force_magnitudes
         self.prev_contact_force_magnitudes = prev_contact_force_magnitudes
+        self.episode_progress = episode_progress
 
         # Contact tracking
         self.contact_body_ids = contact_body_ids

@@ -413,12 +413,27 @@ class PPO(BaseAgent):
 
         mean_action = batch_td["mean_action"]
 
-        # Recompute neglogp for the actions that were actually taken (from experience buffer)
-        # We need the current policy's evaluation, not the sampled action's neglogp
-        mu = mean_action  # Already tanh-bounded
-        std = torch.exp(self.actor.logstd)
-        dist = torch.distributions.Normal(mu, mu * 0 + std)
-        current_neglogp = -dist.log_prob(batch_dict["action"]).sum(dim=-1)
+        # Recompute neglogp for the actions that were actually taken.  Custom
+        # residual actors may provide their own action distribution evaluator;
+        # the action-residual tracker uses a raw Gaussian, matching the
+        # pretrained tracker/environment action interface.
+        if hasattr(self.actor, "neglogp_from_actions"):
+            current_neglogp = self.actor.neglogp_from_actions(
+                batch_dict["action"], batch_td
+            )
+            if hasattr(self.actor, "effective_std_from_tensordict"):
+                std = self.actor.effective_std_from_tensordict(batch_td)
+            else:
+                std = self.actor._effective_std()
+            dist = torch.distributions.Normal(
+                batch_td.get("raw_mean_action", mean_action),
+                batch_td.get("raw_mean_action", mean_action) * 0 + std,
+            )
+        else:
+            mu = mean_action
+            std = torch.exp(self.actor.logstd)
+            dist = torch.distributions.Normal(mu, mu * 0 + std)
+            current_neglogp = -dist.log_prob(batch_dict["action"]).sum(dim=-1)
 
         # Compute probability ratio between new and old policy
         ratio = torch.exp(batch_dict["neglogp"] - current_neglogp)
@@ -462,10 +477,10 @@ class PPO(BaseAgent):
 
         # Compute KL divergence for adaptive learning rate
         if self.config.adaptive_lr.enabled:
+            kl_old_mean = batch_dict.get("raw_mean_action", batch_dict["mean_action"])
+            kl_new_mean = batch_td.get("raw_mean_action", mean_action)
             kl_mean = self._compute_kl(
-                batch_dict["mean_action"].detach(),
-                mu.detach(),
-                std.detach(),
+                kl_old_mean.detach(), kl_new_mean.detach(), std.detach()
             )
             log_dict["actor/kl"] = kl_mean
 
@@ -531,6 +546,25 @@ class PPO(BaseAgent):
                 }
             )
 
+        # L2-SP for parameter-efficient motion adaptation.  The actor owns the
+        # immutable pretrained snapshot because it is materialized lazily from
+        # the official checkpoint.  Keeping this generic lets residual-only
+        # actors omit the term entirely.
+        if hasattr(self.actor, "pretrained_anchor_loss"):
+            anchor_coef = float(
+                getattr(self.actor.config, "pretrained_anchor_coef", 0.0)
+            )
+            if anchor_coef > 0.0:
+                anchor_loss = self.actor.pretrained_anchor_loss()
+                anchor_weighted = anchor_coef * anchor_loss
+                extra_loss = extra_loss + anchor_weighted
+                log_dict.update(
+                    {
+                        "actor/pretrained_anchor_loss": anchor_loss.detach(),
+                        "actor/pretrained_anchor_weighted": anchor_weighted.detach(),
+                    }
+                )
+
         return extra_loss, log_dict
 
     def critic_step(self, batch_dict) -> Tuple[Tensor, Dict]:
@@ -572,11 +606,77 @@ class PPO(BaseAgent):
     # -----------------------------
     # Optimization Override
     # -----------------------------
+    @staticmethod
+    @torch.no_grad()
+    def _snapshot_optimizer_parameters(optimizer):
+        """Clone the trainable parameters owned by an optimizer.
+
+        The snapshot is taken once per PPO epoch, rather than once per
+        minibatch.  This makes it possible to distinguish a small loss from an
+        actor that has genuinely stopped changing.  Frozen pretrained modules
+        are intentionally excluded so the metric describes only the trainable
+        policy adaptation parameters.
+        """
+        snapshots = []
+        seen = set()
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                parameter_id = id(parameter)
+                if not parameter.requires_grad or parameter_id in seen:
+                    continue
+                seen.add(parameter_id)
+                snapshots.append((parameter, parameter.detach().clone()))
+        return snapshots
+
+    @staticmethod
+    @torch.no_grad()
+    def _optimizer_update_metrics(snapshots, prefix: str) -> Dict:
+        """Return scale-independent parameter-update diagnostics."""
+        if not snapshots:
+            return {}
+
+        device = snapshots[0][0].device
+        parameter_sq = torch.zeros((), device=device, dtype=torch.float64)
+        update_sq = torch.zeros((), device=device, dtype=torch.float64)
+        parameter_count = 0
+        for parameter, parameter_before in snapshots:
+            parameter_after = parameter.detach()
+            delta = parameter_after - parameter_before
+            parameter_sq += parameter_after.double().square().sum()
+            update_sq += delta.double().square().sum()
+            parameter_count += parameter.numel()
+
+        parameter_norm = parameter_sq.sqrt().float()
+        update_norm = update_sq.sqrt().float()
+        update_rms = (update_sq / max(parameter_count, 1)).sqrt().float()
+        relative_update = update_norm / parameter_norm.clamp_min(1e-12)
+        return {
+            f"convergence/{prefix}_trainable_parameter_norm": parameter_norm,
+            f"convergence/{prefix}_update_l2": update_norm,
+            f"convergence/{prefix}_update_rms": update_rms,
+            f"convergence/{prefix}_relative_update": relative_update,
+            f"convergence/{prefix}_trainable_parameter_count": torch.tensor(
+                float(parameter_count), device=device
+            ),
+        }
+
     def optimize_model(self) -> Dict:
         # Reset epoch-level actor skip flag
         self._skip_actor_for_epoch = False
 
+        actor_parameter_snapshot = self._snapshot_optimizer_parameters(
+            self.actor_optimizer
+        )
         training_log_dict = super().optimize_model()
+        training_log_dict.update(
+            self._optimizer_update_metrics(actor_parameter_snapshot, "actor")
+        )
+        training_log_dict["info/actor_optimizer_lr"] = torch.tensor(
+            self.actor_optimizer.param_groups[0]["lr"], device=self.device
+        )
+        training_log_dict["info/critic_optimizer_lr"] = torch.tensor(
+            self.critic_optimizer.param_groups[0]["lr"], device=self.device
+        )
         # Merge advantage normalization logs if available
         if hasattr(self, "_adv_norm_log"):
             training_log_dict.update(self._adv_norm_log)

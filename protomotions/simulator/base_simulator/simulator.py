@@ -1139,6 +1139,16 @@ class Simulator(RecordingMixin, ABC):
         clamped_accel = accel.clamp(-max_accel, max_accel)
         clamped_actions = self._previous_actions + prev_delta + clamped_accel
 
+        # Acceleration limiting alone can keep extrapolating the previous
+        # velocity after the requested target has reversed direction.  That
+        # makes the target run away from both the previous and requested
+        # values.  Keep the limited target inside their component-wise
+        # interval: it may hold for a step while braking, but it can never
+        # overshoot away from the policy command.
+        lower = torch.minimum(self._previous_actions, self._common_actions)
+        upper = torch.maximum(self._previous_actions, self._common_actions)
+        clamped_actions = torch.maximum(torch.minimum(clamped_actions, upper), lower)
+
         # Only apply to envs with enough history
         self._common_actions[active] = clamped_actions[active]
 

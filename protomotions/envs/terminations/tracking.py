@@ -67,6 +67,54 @@ def mean_body_pos_error(
     return per_body_err.mean(-1)
 
 
+def reliability_blended_mean_body_pos_error(
+    current_rigid_body_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    reference_reliability: Tensor,
+    minimum_absolute_weight: float = 0.05,
+    gravity_axis_only: bool = False,
+) -> Tensor:
+    """Blend global and root-relative position errors by observation confidence.
+
+    A low-confidence video root must not make an otherwise faithful physical
+    execution fail evaluation.  Conversely, confidence only removes the shared
+    translation component: body articulation remains fully evaluated in the
+    root-relative term.  The expression mirrors
+    ``compute_reliability_blended_position_rew`` but remains in metric units.
+    """
+    if not 0.0 <= minimum_absolute_weight <= 1.0:
+        raise ValueError("minimum_absolute_weight must lie in [0, 1]")
+    reliability = reference_reliability.reshape(-1).clamp(0.0, 1.0)
+    absolute_weight = minimum_absolute_weight + (
+        1.0 - minimum_absolute_weight
+    ) * reliability
+
+    if gravity_axis_only:
+        vertical_offset = (
+            current_rigid_body_pos[:, :1, 2:3]
+            - ref_rigid_body_pos[:, :1, 2:3]
+        ) * (1.0 - absolute_weight[:, None, None])
+        root_offset = torch.cat(
+            (
+                torch.zeros_like(vertical_offset).expand(-1, -1, 2),
+                vertical_offset,
+            ),
+            dim=-1,
+        )
+        gated_reference = ref_rigid_body_pos + root_offset
+        return mean_body_pos_error(current_rigid_body_pos, gated_reference)
+
+    absolute_error = mean_body_pos_error(
+        current_rigid_body_pos, ref_rigid_body_pos
+    )
+    current_relative = current_rigid_body_pos - current_rigid_body_pos[:, :1, :]
+    reference_relative = ref_rigid_body_pos - ref_rigid_body_pos[:, :1, :]
+    relative_error = mean_body_pos_error(current_relative, reference_relative)
+    return absolute_weight * absolute_error + (
+        1.0 - absolute_weight
+    ) * relative_error
+
+
 def max_body_pos_error(
     current_rigid_body_pos: Tensor,
     ref_rigid_body_pos: Tensor,
@@ -220,6 +268,25 @@ def compute_tracking_error(
     max_joint_err = gt_per_joint_err.max(-1)[0]
     terminate = max_joint_err > threshold
     return terminate
+
+
+def compute_reliability_blended_tracking_error(
+    current_rigid_body_pos: Tensor,
+    ref_rigid_body_pos: Tensor,
+    reference_reliability: Tensor,
+    error_threshold: float = 0.5,
+    minimum_absolute_weight: float = 0.05,
+    gravity_axis_only: bool = False,
+) -> Tensor:
+    """Terminate on confidence-aware global/relative position divergence."""
+    error = reliability_blended_mean_body_pos_error(
+        current_rigid_body_pos,
+        ref_rigid_body_pos,
+        reference_reliability,
+        minimum_absolute_weight=minimum_absolute_weight,
+        gravity_axis_only=gravity_axis_only,
+    )
+    return error > error_threshold
 
 
 def anchor_height_error_value(

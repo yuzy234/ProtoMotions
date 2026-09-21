@@ -42,7 +42,7 @@ Includes:
 
 import torch
 from torch import Tensor
-from typing import Optional
+from typing import List, Optional
 
 from protomotions.envs.rewards.base import power_consumption_sum, delta_norm, delta_logmeanexp
 
@@ -67,6 +67,192 @@ def compute_action_smoothness(
         Smoothness penalty tensor [num_envs].
     """
     return delta_norm(current_processed_action, previous_processed_action)
+
+
+def compute_reset_aware_action_smoothness(
+    current_processed_action: Tensor,
+    previous_processed_action: Tensor,
+    episode_progress: Tensor,
+    ignore_first_steps: int = 1,
+) -> Tensor:
+    """Action delta that ignores only invalid zero history after a reset.
+
+    ``previous_processed_action`` is artificially zero before the first control
+    step.  From the second step onward it is a real policy action and should be
+    regularized, including during the remaining reset grace period.
+    """
+    penalty = delta_norm(current_processed_action, previous_processed_action)
+    if ignore_first_steps <= 0:
+        return penalty
+    return torch.where(episode_progress <= ignore_first_steps, 0.0, penalty)
+
+
+def compute_reset_aware_action_acceleration(
+    current_processed_action: Tensor,
+    historical_processed_actions: Tensor,
+    episode_progress: Tensor,
+    indices: Optional[List[int]] = None,
+    ignore_first_steps: int = 2,
+) -> Tensor:
+    """Penalize the second finite difference of processed policy actions.
+
+    Unlike first-difference smoothing, this permits a sustained correction but
+    penalizes alternating commands, which are a common source of visible joint
+    jerk. ``historical_processed_actions[:, 0]`` is the previous action and
+    index 1 is the action before that.  The first two post-reset steps are
+    ignored because their history is synthetic.
+    """
+    if historical_processed_actions.shape[1] < 2:
+        raise ValueError(
+            "Action acceleration requires env.num_state_history_steps >= 2."
+        )
+    previous = historical_processed_actions[:, 0]
+    previous_previous = historical_processed_actions[:, 1]
+    acceleration = current_processed_action - 2.0 * previous + previous_previous
+    if indices is not None:
+        acceleration = acceleration[:, indices]
+    penalty = torch.linalg.vector_norm(acceleration, dim=-1)
+    if ignore_first_steps <= 0:
+        return penalty
+    return torch.where(episode_progress <= ignore_first_steps, 0.0, penalty)
+
+
+def relax_regularization_with_demand(
+    penalty: Tensor,
+    demand: Tensor,
+    minimum_multiplier: float = 0.1,
+) -> Tensor:
+    """Relax a smoothness penalty only where dynamics require an impulse."""
+    if not 0.0 <= minimum_multiplier <= 1.0:
+        raise ValueError("minimum_multiplier must lie in [0, 1]")
+    demand = demand.reshape(demand.shape[0], -1)
+    if demand.shape[1] != 1 or demand.shape[0] != penalty.shape[0]:
+        raise ValueError("demand must be scalar per environment")
+    multiplier = 1.0 - (1.0 - minimum_multiplier) * demand[:, 0].clamp(0.0, 1.0)
+    return penalty * multiplier
+
+
+def compute_demand_relaxed_action_smoothness(
+    current_processed_action: Tensor,
+    previous_processed_action: Tensor,
+    episode_progress: Tensor,
+    current_ref_body_vel: Tensor,
+    future_ref_root_vel: Tensor,
+    current_ref_contacts: Tensor,
+    future_reference_reliability: Tensor,
+    support_body_ids: Optional[List[int]] = None,
+    vertical_speed_scale: float = 3.0,
+    horizon_weights: Optional[List[float]] = None,
+    minimum_multiplier: float = 0.1,
+    ignore_first_steps: int = 1,
+) -> Tensor:
+    """Reset-aware action delta with contact-transition-aware relaxation."""
+    from protomotions.envs.obs.target_poses import (
+        build_contact_conditioned_takeoff_demand,
+    )
+
+    penalty = compute_reset_aware_action_smoothness(
+        current_processed_action,
+        previous_processed_action,
+        episode_progress,
+        ignore_first_steps,
+    )
+    demand = build_contact_conditioned_takeoff_demand(
+        current_ref_body_vel,
+        future_ref_root_vel,
+        current_ref_contacts,
+        future_reference_reliability,
+        support_body_ids,
+        vertical_speed_scale,
+        horizon_weights,
+    )
+    return relax_regularization_with_demand(
+        penalty, demand, minimum_multiplier=minimum_multiplier
+    )
+
+
+def compute_demand_relaxed_action_acceleration(
+    current_processed_action: Tensor,
+    historical_processed_actions: Tensor,
+    episode_progress: Tensor,
+    current_ref_body_vel: Tensor,
+    future_ref_root_vel: Tensor,
+    current_ref_contacts: Tensor,
+    future_reference_reliability: Tensor,
+    indices: Optional[List[int]] = None,
+    support_body_ids: Optional[List[int]] = None,
+    vertical_speed_scale: float = 3.0,
+    horizon_weights: Optional[List[float]] = None,
+    minimum_multiplier: float = 0.1,
+    ignore_first_steps: int = 2,
+) -> Tensor:
+    """Action second difference relaxed during required support impulses."""
+    from protomotions.envs.obs.target_poses import (
+        build_contact_conditioned_takeoff_demand,
+    )
+
+    penalty = compute_reset_aware_action_acceleration(
+        current_processed_action,
+        historical_processed_actions,
+        episode_progress,
+        indices,
+        ignore_first_steps,
+    )
+    demand = build_contact_conditioned_takeoff_demand(
+        current_ref_body_vel,
+        future_ref_root_vel,
+        current_ref_contacts,
+        future_reference_reliability,
+        support_body_ids,
+        vertical_speed_scale,
+        horizon_weights,
+    )
+    return relax_regularization_with_demand(
+        penalty, demand, minimum_multiplier=minimum_multiplier
+    )
+
+
+def compute_reset_aware_relative_body_angular_jerk(
+    current_rigid_body_ang_vel: Tensor,
+    historical_rigid_body_ang_vel: Tensor,
+    episode_progress: Tensor,
+    body_indices: List[int],
+    parent_indices: List[int],
+    ignore_first_steps: int = 2,
+) -> Tensor:
+    """Penalize step-wise angular jerk of selected joints.
+
+    A joint's angular velocity is approximated by child minus parent rigid-body
+    angular velocity. This removes global/root rotation before taking the
+    second finite difference and directly targets oscillatory joint motion.
+    The result is left in per-control-step units so reward magnitudes do not
+    depend on a large ``dt**-2`` scale factor.
+    """
+    if len(body_indices) != len(parent_indices):
+        raise ValueError("body_indices and parent_indices must have equal length.")
+    if historical_rigid_body_ang_vel.shape[1] < 2:
+        raise ValueError(
+            "Relative body angular jerk requires env.num_state_history_steps >= 2."
+        )
+
+    current_relative = (
+        current_rigid_body_ang_vel[:, body_indices]
+        - current_rigid_body_ang_vel[:, parent_indices]
+    )
+    previous_all = historical_rigid_body_ang_vel[:, 0]
+    previous_previous_all = historical_rigid_body_ang_vel[:, 1]
+    previous_relative = previous_all[:, body_indices] - previous_all[:, parent_indices]
+    previous_previous_relative = (
+        previous_previous_all[:, body_indices]
+        - previous_previous_all[:, parent_indices]
+    )
+    angular_jerk = (
+        current_relative - 2.0 * previous_relative + previous_previous_relative
+    )
+    penalty = torch.linalg.vector_norm(angular_jerk, dim=-1).mean(dim=-1)
+    if ignore_first_steps <= 0:
+        return penalty
+    return torch.where(episode_progress <= ignore_first_steps, 0.0, penalty)
 
 
 def compute_action_smoothness_logmeanexp(
@@ -155,7 +341,7 @@ def compute_contact_match_rew(
 def compute_contact_force_change_rew(
     current_contact_force_magnitudes: Tensor,
     prev_contact_force_magnitudes: Tensor,
-    threshold: float = 30.0,
+    force_change_threshold: float = 30.0,
 ) -> Tensor:
     """Contact force change penalty.
     
@@ -164,14 +350,25 @@ def compute_contact_force_change_rew(
     Args:
         current_contact_force_magnitudes: Current contact forces [num_envs, num_bodies].
         prev_contact_force_magnitudes: Previous contact forces [num_envs, num_bodies].
-        threshold: Force change threshold below which changes are ignored (default: 30.0).
+        force_change_threshold: Force change below which impact is ignored.
     
     Returns:
         Total force change above threshold [num_envs].
     """
     force_changes = torch.abs(current_contact_force_magnitudes - prev_contact_force_magnitudes)
-    force_changes = torch.clamp(force_changes - threshold, min=0)
+    force_changes = torch.clamp(force_changes - force_change_threshold, min=0)
     return force_changes.sum(dim=-1)
+
+
+def compute_foot_sliding_rew(
+    rigid_body_vel: Tensor,
+    rigid_body_contacts: Tensor,
+    contact_body_ids: Tensor,
+) -> Tensor:
+    """Horizontal foot speed while the simulator reports physical contact."""
+    foot_vel_xy = rigid_body_vel[:, contact_body_ids, :2]
+    foot_contacts = rigid_body_contacts[:, contact_body_ids].float()
+    return (torch.linalg.vector_norm(foot_vel_xy, dim=-1) * foot_contacts).sum(-1)
 
 
 # =============================================================================
@@ -263,11 +460,15 @@ def impact_force_penalty(
 __all__ = [
     # Main reward kernels
     "compute_action_smoothness",
+    "compute_reset_aware_action_smoothness",
+    "compute_reset_aware_action_acceleration",
+    "compute_reset_aware_relative_body_angular_jerk",
     "compute_action_smoothness_logmeanexp",
     "compute_pow_rew",
     "compute_soft_pos_limit_rew",
     "compute_contact_match_rew",
     "compute_contact_force_change_rew",
+    "compute_foot_sliding_rew",
     # Helper functions
     "joint_limit_violation",
     "contact_mismatch_sum",

@@ -122,6 +122,8 @@ class MotionLib:
     motion_num_frames: torch.Tensor
     motion_weights: torch.Tensor
     contacts: torch.Tensor
+    root_reference_reliability: Optional[torch.Tensor] = None
+    root_physical_reliability: Optional[torch.Tensor] = None
 
     motion_files: Tuple[str]
 
@@ -194,6 +196,8 @@ class MotionLib:
         self.motion_num_frames = torch.empty(0, dtype=torch.long, device=self.device)
         self.motion_weights = torch.empty(0, device=self.device)
         self.contacts = torch.empty(0, 0, device=self.device)
+        self.root_reference_reliability = None
+        self.root_physical_reliability = None
         self.motion_files = ()
         self.lrs = None
 
@@ -258,6 +262,47 @@ class MotionLib:
             return self.motion_num_frames
         else:
             return self.motion_num_frames[motion_ids]
+
+    def get_root_reference_reliability(
+        self, motion_ids: torch.Tensor, motion_times: torch.Tensor
+    ) -> torch.Tensor:
+        """Interpolate per-frame physical confidence, defaulting to fully trusted.
+
+        Packaged video motions may carry ``root_reference_reliability`` from a
+        support/flight consistency pass.  Older and generic motion libraries do
+        not, so preserving a value of one keeps their behavior unchanged.
+        """
+        if self.root_reference_reliability is None:
+            return torch.ones_like(motion_times, dtype=torch.float32)
+        frame_idx0, frame_idx1, blend = self._calc_frame_blend_from_id_and_time(
+            motion_ids, motion_times
+        )
+        flat0 = frame_idx0 + self.length_starts[motion_ids]
+        flat1 = frame_idx1 + self.length_starts[motion_ids]
+        value0 = self.root_reference_reliability[flat0].float()
+        value1 = self.root_reference_reliability[flat1].float()
+        return value0 + (value1 - value0) * blend
+
+    def get_root_physical_reliability(
+        self, motion_ids: torch.Tensor, motion_times: torch.Tensor
+    ) -> torch.Tensor:
+        """Interpolate scene-physics confidence for phase control.
+
+        This channel excludes visual evidence.  It therefore answers whether
+        the recorded timing/root path is dynamically plausible, while
+        ``root_reference_reliability`` answers how strongly absolute root
+        placement should be tracked.  Legacy files fall back to the latter.
+        """
+        if self.root_physical_reliability is None:
+            return self.get_root_reference_reliability(motion_ids, motion_times)
+        frame_idx0, frame_idx1, blend = self._calc_frame_blend_from_id_and_time(
+            motion_ids, motion_times
+        )
+        flat0 = frame_idx0 + self.length_starts[motion_ids]
+        flat1 = frame_idx1 + self.length_starts[motion_ids]
+        value0 = self.root_physical_reliability[flat0].float()
+        value1 = self.root_physical_reliability[flat1].float()
+        return value0 + (value1 - value0) * blend
 
     def process_packaged_motion_file_name_multi_gpu(self, motion_file):
         if "slurmrank" not in motion_file:
@@ -614,6 +659,13 @@ class MotionLib:
         for field in loaded_data:
             assert loaded_data[field] is not None, f"Field {field} is None"
             setattr(self, field, loaded_data[field])
+
+        # Backward compatible: generic/pretrained motion packages do not carry
+        # the video-specific physical confidence channel.
+        if "root_reference_reliability" not in loaded_data:
+            self.root_reference_reliability = None
+        if "root_physical_reliability" not in loaded_data:
+            self.root_physical_reliability = None
 
         if (
             self.contacts is not None

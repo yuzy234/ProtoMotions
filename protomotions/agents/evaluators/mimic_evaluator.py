@@ -53,6 +53,7 @@ class MimicEvaluator(BaseEvaluator):
     def _register_plugins(self) -> None:
         """Register metric computation plugins."""
         self._register_smoothness_plugin(window_sec=0.4, high_jerk_threshold=6500.0)
+        self._register_opening_jerk_plugin(duration_sec=0.5)
         self._register_action_smoothness_plugin()
 
     def _create_metrics(
@@ -87,6 +88,12 @@ class MimicEvaluator(BaseEvaluator):
         self._env_snapshot = self.env.save_state()
         self._cached_motion_ids = self.motion_manager.motion_ids.clone()
         self._cached_motion_times = self.motion_manager.motion_times.clone()
+        self._cached_clip_mode = None
+        if hasattr(self.motion_manager, "set_clip_mode"):
+            self._cached_clip_mode = self.motion_manager.clip_mode_enabled
+            # Periodic evaluation must run the complete reference motion, not
+            # stop at the two-second training-window boundary.
+            self.motion_manager.set_clip_mode(False)
 
         return self._create_metrics(
             num_motions, motion_num_frames, self.config.max_eval_steps
@@ -137,6 +144,98 @@ class MimicEvaluator(BaseEvaluator):
         sampling weight, creating curriculum pressure toward smooth policies.
         """
         ema_alpha = self.config.eval_action_ema_alpha
+        adaptive_alpha_min = self.config.eval_action_ema_alpha_min
+        adaptive_alpha_max = self.config.eval_action_ema_alpha_max
+        adaptive_enabled = (
+            adaptive_alpha_min is not None and adaptive_alpha_max is not None
+        )
+        contact_alpha = self.config.eval_action_ema_contact_alpha
+        if adaptive_enabled and adaptive_alpha_min > adaptive_alpha_max:
+            raise ValueError(
+                "eval_action_ema_alpha_min must not exceed "
+                "eval_action_ema_alpha_max."
+            )
+
+        dof_names = self.env.robot_config.kinematic_info.dof_names
+        body_names = self.env.robot_config.kinematic_info.body_names
+        side_action_ids = {}
+        side_contact_body_ids = {}
+        for side in ("L", "R"):
+            side_action_ids[side] = torch.tensor(
+                [
+                    index
+                    for index, name in enumerate(dof_names)
+                    if name.startswith(f"{side}_")
+                    and any(
+                        joint in name
+                        for joint in ("Hip", "Knee", "Ankle", "Toe")
+                    )
+                ],
+                dtype=torch.long,
+                device=self.env.device,
+            )
+            side_contact_body_ids[side] = torch.tensor(
+                [
+                    index
+                    for index, name in enumerate(body_names)
+                    if name.startswith(f"{side}_")
+                    and any(part in name for part in ("Ankle", "Toe", "Foot"))
+                ],
+                dtype=torch.long,
+                device=self.env.device,
+            )
+
+        def smooth_actions(
+            actions: torch.Tensor, previous: Optional[torch.Tensor]
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            if previous is None:
+                return actions, actions.clone()
+            if adaptive_enabled:
+                delta_rms = torch.sqrt(
+                    (actions - previous).square().mean(dim=-1, keepdim=True)
+                )
+                confidence = torch.exp(
+                    -delta_rms / self.config.eval_action_ema_delta_scale
+                )
+                alpha = adaptive_alpha_min + (
+                    adaptive_alpha_max - adaptive_alpha_min
+                ) * confidence
+            elif ema_alpha is not None:
+                alpha = ema_alpha
+            else:
+                return actions, actions.clone()
+            if not isinstance(alpha, torch.Tensor):
+                alpha = actions.new_full((actions.shape[0], 1), float(alpha))
+            alpha = alpha.expand_as(actions).clone()
+            if contact_alpha is not None and actions.shape[-1] == len(dof_names):
+                contact_forces = (
+                    self.env.simulator.get_robot_state().rigid_body_contact_forces
+                )
+                for side in ("L", "R"):
+                    action_ids = side_action_ids[side]
+                    body_ids = side_contact_body_ids[side]
+                    if action_ids.numel() == 0 or body_ids.numel() == 0:
+                        continue
+                    side_force = torch.linalg.vector_norm(
+                        contact_forces[:, body_ids], dim=-1
+                    ).amax(dim=-1)
+                    in_contact = side_force > (
+                        self.config.eval_action_ema_contact_force_threshold
+                    )
+                    capped = torch.minimum(
+                        alpha[:, action_ids],
+                        alpha.new_full(
+                            (actions.shape[0], action_ids.numel()),
+                            float(contact_alpha),
+                        ),
+                    )
+                    alpha[:, action_ids] = torch.where(
+                        in_contact.unsqueeze(-1),
+                        capped,
+                        alpha[:, action_ids],
+                    )
+            filtered = alpha * actions + (1.0 - alpha) * previous
+            return filtered, filtered.clone()
 
         self._on_episode_start(env_ids)
 
@@ -146,23 +245,69 @@ class MimicEvaluator(BaseEvaluator):
 
         prev_actions = None
 
+        # A reference-state reset has no valid previous action/contact history.
+        # Hold time at t=0 briefly so the policy can settle the terrain-safe
+        # spawn before the motion and trajectory metrics begin.
+        for _ in range(self.config.eval_pre_roll_steps):
+            model_outs = self.agent.model(obs_td)
+            actions = model_outs.get("mean_action", model_outs.get("action"))
+            if ema_alpha is not None or adaptive_enabled:
+                actions, prev_actions = smooth_actions(actions, prev_actions)
+            self.env.step(actions)
+            self.motion_manager.motion_times[env_ids] = 0.0
+            # The step computed observations at t=dt. Rebuild them at the held
+            # t=0 reference while preserving the newly established sim history.
+            self.env._current_context = None
+            self.env.compute_observations(context=self.env.context)
+            obs = self.env.get_obs()
+            obs = self.agent.add_agent_info_to_obs(obs)
+            obs_td = self.agent.obs_dict_to_tensordict(obs)
+
+        # Pre-roll intentionally pins the public reference time to zero.  An
+        # adaptive phase controller also carries a previous-rate prior, so
+        # clear that private state before the scored rollout starts.
+        adaptive_phase_enabled = False
+        for component in self.env.control_manager.components.values():
+            if getattr(component.config, "adaptive_phase_enabled", False):
+                adaptive_phase_enabled = True
+                component.reset_adaptive_phase_state(env_ids)
+
+        # With adaptive phase, wall-clock step count is no longer the motion
+        # frame index.  Score and record an environment only until its actual
+        # reference clock reaches the clip end.  Continuing to the nominal
+        # duration would compare a moving/falling robot against a frozen final
+        # pose and can inflate errors by metres.
+        active_mask = torch.ones(
+            env_ids.shape[0], dtype=torch.bool, device=env_ids.device
+        )
+
         for step_idx in range(max_steps):
             model_outs = self.agent.model(obs_td)
             actions = model_outs.get("mean_action", model_outs.get("action"))
+            if "root_pos_residual_scaled" in model_outs and hasattr(
+                self.env, "set_reference_root_residual"
+            ):
+                self.env.set_reference_root_residual(
+                    model_outs["root_pos_residual_scaled"]
+                )
 
             # Apply EMA smoothing (deployment simulation)
-            if ema_alpha is not None:
-                if prev_actions is None:
-                    prev_actions = actions.clone()
-                actions = ema_alpha * actions + (1.0 - ema_alpha) * prev_actions
-                prev_actions = actions.clone()
+            if ema_alpha is not None or adaptive_enabled:
+                actions, prev_actions = smooth_actions(actions, prev_actions)
 
             obs, rewards, dones, terminated, extras = self.env.step(actions)
             obs = self.agent.add_agent_info_to_obs(obs)
             obs_td = self.agent.obs_dict_to_tensordict(obs)
 
+            self._episode_active_mask = active_mask.clone()
             self._check_eval_components(env_ids, step_idx)
             self._on_episode_step(env_ids, extras, actions)
+
+            if adaptive_phase_enabled:
+                reached_end = self.motion_manager.get_done_tracks(env_ids)
+                active_mask &= ~reached_end
+                if not active_mask.any():
+                    break
 
     def run_evaluation(self) -> None:
         """Run evaluation across multiple motions."""
@@ -219,6 +364,8 @@ class MimicEvaluator(BaseEvaluator):
     def _check_eval_components(self, env_ids: Tensor, step_idx: int) -> None:
         """Filter by frame limits and check failures only for active clips."""
         still_active = self._episode_ctx.frame_limits > step_idx
+        if hasattr(self, "_episode_active_mask"):
+            still_active &= self._episode_active_mask
         if still_active.any():
             active_env_ids = env_ids[still_active]
             active_motion_ids = self._episode_ctx.motion_ids[still_active]
@@ -226,8 +373,16 @@ class MimicEvaluator(BaseEvaluator):
     
     def _on_episode_step(self, env_ids: Tensor, extras: Dict, actions: Tensor) -> None:
         """Collect smoothness metrics each step."""
+        if hasattr(self, "_episode_active_mask"):
+            active_mask = self._episode_active_mask
+            env_ids = env_ids[active_mask]
+            motion_ids = self._episode_ctx.motion_ids[active_mask]
+        else:
+            motion_ids = self._episode_ctx.motion_ids
+        if env_ids.numel() == 0:
+            return
         self._record_trajectory_step(
-            self._metrics, extras, env_ids, self._episode_ctx.motion_ids, actions
+            self._metrics, extras, env_ids, motion_ids, actions
         )
 
     def _record_trajectory_step(
@@ -256,6 +411,46 @@ class MimicEvaluator(BaseEvaluator):
         additional_metrics = self._compute_additional_metrics(self._metrics)
         to_log.update(additional_metrics)
 
+        evaluated_score = success_rate
+        if getattr(self.config, "quality_checkpoint_score", False) and success_rate is not None:
+            # Success remains the primary objective. Among controllers with the
+            # same success rate, prefer lower tracking error and less temporal
+            # jitter. These metrics are already produced by the full-motion
+            # evaluator and therefore match deployment better than rollout loss.
+            position_metric = getattr(
+                self.config, "quality_score_position_metric", "gt_error"
+            )
+            position_metric_key = f"eval/{position_metric}/mean"
+            if position_metric_key not in to_log:
+                raise KeyError(
+                    "Quality-score position metric is unavailable: "
+                    f"{position_metric_key}"
+                )
+            penalties = {
+                "gt": getattr(self.config, "quality_score_gt_weight", 1.0)
+                * to_log[position_metric_key],
+                "gr": getattr(self.config, "quality_score_gr_weight", 0.25)
+                * to_log.get("eval/gr_error/mean", 0.0),
+                "jerk": getattr(self.config, "quality_score_jerk_weight", 1.0e-4)
+                * to_log.get("eval/normalized_jerk_mean", 0.0),
+                "opening_jerk": getattr(
+                    self.config, "quality_score_opening_jerk_weight", 2.0e-4
+                )
+                * to_log.get("eval/opening_body_jerk_rms_m_s3", 0.0),
+                "action_delta": getattr(
+                    self.config, "quality_score_action_delta_weight", 0.1
+                )
+                * to_log.get("eval/action_delta_mean_rad", 0.0),
+            }
+            evaluated_score = (
+                getattr(self.config, "quality_score_success_weight", 10.0)
+                * success_rate
+                - sum(penalties.values())
+            )
+            to_log["eval/quality_score"] = evaluated_score
+            for name, value in penalties.items():
+                to_log[f"eval/quality_penalty/{name}"] = value
+
         if self.fabric.global_rank == 0:
             if (
                 self.config.save_predicted_motion_lib_every is not None
@@ -263,17 +458,22 @@ class MimicEvaluator(BaseEvaluator):
             ):
                 self._save_predicted_motion_lib(self._metrics, epoch=self.agent.current_epoch)
 
-        return to_log, success_rate
+        return to_log, evaluated_score
 
     def cleanup_after_evaluation(self) -> None:
         """Restore env and motion manager state after evaluation."""
         self.motion_manager.motion_ids = self._cached_motion_ids
         self.motion_manager.motion_times = self._cached_motion_times
+        if self._cached_clip_mode is not None:
+            self.motion_manager.set_clip_mode(self._cached_clip_mode)
         self.env.restore_state(self._env_snapshot)
         
         del self._env_snapshot
         del self._cached_motion_ids
         del self._cached_motion_times
+        del self._cached_clip_mode
+        if hasattr(self, "_episode_active_mask"):
+            del self._episode_active_mask
         super().cleanup_after_evaluation()
 
     def _plot_per_frame_metrics(
@@ -307,8 +507,9 @@ class MimicEvaluator(BaseEvaluator):
     ) -> None:
         """Pack collected predicted metrics and save as a MotionLib-compatible .pt file.
 
-        This creates a "predicted" version of MotionLib where unknown fields are copied
-        from the ground-truth self.motion_lib.
+        This creates a predicted MotionLib and preserves per-motion identity/
+        shape metadata from the source library. Local rotations are deliberately
+        not copied because they would be inconsistent with the simulated pose.
 
         Args:
             metrics: Dictionary of MotionMetrics objects containing predicted data
@@ -428,6 +629,24 @@ class MimicEvaluator(BaseEvaluator):
             "motion_files": motion_files,
             "contacts": contacts,  # Always save predicted contacts
         }
+
+        # These fields are motion-level metadata, not predicted state. Keeping
+        # them is required for --smpl-shape-from-motion and traceability in a
+        # physics-consistent-reference distillation stage.
+        for key in (
+            "motion_betas",
+            "motion_genders",
+            "motion_asset_files",
+            "source_global_ids",
+        ):
+            value = getattr(gt_lib, key, None)
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                value = value.detach().clone()
+            elif isinstance(value, (list, tuple)):
+                value = tuple(value)
+            save_data[key] = value
 
         # create dir if not exists
         output_dir = self.root_dir / "results"

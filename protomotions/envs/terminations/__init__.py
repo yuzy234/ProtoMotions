@@ -42,6 +42,7 @@ from protomotions.envs.terminations.base import (
 # Tracking termination kernels
 from protomotions.envs.terminations.tracking import (
     compute_tracking_error,
+    compute_reliability_blended_tracking_error,
     compute_anchor_pos_error_term,
     compute_anchor_ori_error_term,
     compute_relative_body_pos_error_term,
@@ -49,6 +50,7 @@ from protomotions.envs.terminations.tracking import (
     motion_clip_done,
     # Value functions (for evaluation metrics)
     mean_body_pos_error,
+    reliability_blended_mean_body_pos_error,
     max_body_pos_error,
     mean_body_rot_error,
     anchor_pos_error_value,
@@ -78,6 +80,7 @@ __all__ = [
     "contact_termination",
     # Tracking termination kernels
     "compute_tracking_error",
+    "compute_reliability_blended_tracking_error",
     "compute_anchor_pos_error_term",
     "compute_anchor_ori_error_term",
     "compute_relative_body_pos_error_term",
@@ -85,6 +88,7 @@ __all__ = [
     "motion_clip_done",
     # Value functions
     "mean_body_pos_error",
+    "reliability_blended_mean_body_pos_error",
     "max_body_pos_error",
     "mean_body_rot_error",
     "anchor_pos_error_value",

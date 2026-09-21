@@ -206,6 +206,11 @@ def configure_robot_and_simulator(
     robot_cfg.update_fields(
         contact_bodies=["all_left_foot_bodies", "all_right_foot_bodies"]
     )
+    # Projectiles are an interactive viewer feature (J key), not part of the
+    # tracking task or its reward.  Keeping the default pool of five creates
+    # 10,240 unused dynamic actors at 2,048 environments and can exhaust
+    # Isaac Gym's pinned-memory allocations before training starts.
+    simulator_cfg.projectile.num_projectiles = 0
 
 
 def apply_inference_overrides(
