@@ -950,6 +950,21 @@ class NewtonSimulator(Simulator):
 
         return contact_binary
 
+    def park_envs(
+        self,
+        env_ids: torch.Tensor,
+        hide_z: float = -50.0,
+    ) -> None:
+        """Leave inactive evaluation environments in place on Newton.
+
+        Parking exists to reduce PhysX cross-environment broadphase pairs.
+        Newton/MuJoCo-Warp has isolated per-world contact buffers, so moving
+        unused robots far below the terrain provides no benefit. It can also
+        make parked robots free-fall until their state becomes non-finite,
+        poisoning solver warm-start state after evaluation restores them.
+        """
+        return None
+
     def _get_simulator_bodies_state(
         self, env_ids: Optional[torch.Tensor] = None
     ) -> RobotState:

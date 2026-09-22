@@ -38,6 +38,16 @@ class EvaluatorConfig:
         default=200,
         metadata={"help": "Evaluate metrics every N epochs. None = disabled.", "min": 1}
     )
+    reset_training_envs_after_eval: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Reset all training environments at the next rollout boundary "
+                "after an in-process evaluation. Physics contact warm-start "
+                "state is backend-internal and cannot be snapshotted exactly."
+            )
+        },
+    )
 
 
 @dataclass
@@ -70,6 +80,15 @@ class MimicEvaluatorConfig(EvaluatorConfig):
     motion_weights_rules: MotionWeightsRulesConfig = field(
         default_factory=MotionWeightsRulesConfig,
         metadata={"help": "Rules for updating motion sampling weights."}
+    )
+    park_inactive_envs: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Move environments not used by a fixed-motion evaluation out "
+                "of the collision scene. Disable only for backend diagnostics."
+            )
+        },
     )
     eval_action_ema_alpha: Optional[float] = field(
         default=None,

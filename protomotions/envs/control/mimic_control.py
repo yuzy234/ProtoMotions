@@ -207,6 +207,15 @@ class MimicControl(ControlComponent):
         self._adaptive_phase_rate = torch.ones(
             env.num_envs, dtype=torch.float32, device=env.device
         )
+        self._needs_reference_reliability = env.requires_context_path(
+            "mimic.reference_reliability"
+        )
+        self._needs_future_reference_reliability = env.requires_context_path(
+            "mimic.future_reference_reliability"
+        )
+        self._needs_ref_ground_heights = env.requires_context_path(
+            "mimic.ref_ground_heights"
+        )
 
     @staticmethod
     def _root_local_body_positions(state) -> Tensor:
@@ -339,17 +348,22 @@ class MimicControl(ControlComponent):
         device = self.env.device
         motion_ids = self.env.motion_manager.motion_ids
         motion_times = self.env.motion_manager.motion_times
-        reference_reliability = (
-            self.env.motion_lib.get_root_reference_reliability(
-                motion_ids, motion_times
+        if self._needs_reference_reliability:
+            reference_reliability = (
+                self.env.motion_lib.get_root_reference_reliability(
+                    motion_ids, motion_times
+                )
             )
-        )
-        reference_reliability = calibrate_reference_reliability(
-            reference_reliability,
-            low=self.config.reference_reliability_gate_low,
-            high=self.config.reference_reliability_gate_high,
-            smoothstep=self.config.reference_reliability_gate_smoothstep,
-        )
+            reference_reliability = calibrate_reference_reliability(
+                reference_reliability,
+                low=self.config.reference_reliability_gate_low,
+                high=self.config.reference_reliability_gate_high,
+                smoothstep=self.config.reference_reliability_gate_smoothstep,
+            )
+        else:
+            reference_reliability = torch.ones(
+                num_envs, dtype=torch.float32, device=device
+            )
         
         # Get single-step reference state at current time (for rewards)
         ref_state = self.env.motion_lib.get_motion_state(motion_ids, motion_times)
@@ -387,18 +401,23 @@ class MimicControl(ControlComponent):
         ).reshape(-1)
         flat_future_times = future_times.reshape(-1)
 
-        future_reference_reliability = (
-            self.env.motion_lib.get_root_reference_reliability(
-                flat_motion_ids, flat_future_times
+        if self._needs_future_reference_reliability:
+            future_reference_reliability = (
+                self.env.motion_lib.get_root_reference_reliability(
+                    flat_motion_ids, flat_future_times
+                )
+                .view(num_envs, future_steps)
             )
-            .view(num_envs, future_steps)
-        )
-        future_reference_reliability = calibrate_reference_reliability(
-            future_reference_reliability,
-            low=self.config.reference_reliability_gate_low,
-            high=self.config.reference_reliability_gate_high,
-            smoothstep=self.config.reference_reliability_gate_smoothstep,
-        )
+            future_reference_reliability = calibrate_reference_reliability(
+                future_reference_reliability,
+                low=self.config.reference_reliability_gate_low,
+                high=self.config.reference_reliability_gate_high,
+                smoothstep=self.config.reference_reliability_gate_smoothstep,
+            )
+        else:
+            future_reference_reliability = torch.ones(
+                num_envs, future_steps, dtype=torch.float32, device=device
+            )
         
         # Query motion lib for all future steps
         future_state = self.env.motion_lib.get_motion_state(
@@ -450,9 +469,12 @@ class MimicControl(ControlComponent):
         
         hinge_axes_map = self.env.robot_config.kinematic_info.hinge_axes_map
         ref_lr = dof_to_local(ref_state.dof_pos, hinge_axes_map, True)
-        ref_ground_heights = self.env.terrain.get_ground_heights(
-            ref_state.rigid_body_pos
-        )
+        if self._needs_ref_ground_heights:
+            ref_ground_heights = self.env.terrain.get_ground_heights(
+                ref_state.rigid_body_pos
+            )
+        else:
+            ref_ground_heights = torch.zeros_like(ref_state.rigid_body_pos[..., 2])
         blend_time = self.env.config.safe_reference_reset_blend_time
         if blend_time > 0.0:
             blend_progress = (

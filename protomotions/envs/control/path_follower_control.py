@@ -119,6 +119,22 @@ class PathFollowerControl(ControlComponent):
         # Reset path starting from ground-relative head position
         self.path_generator.reset(env_ids, head_position)
 
+    def save_runtime_state(self) -> Dict[str, Any]:
+        state = super().save_runtime_state()
+        state["path_generator_verts"] = self.path_generator.verts.clone()
+        return state
+
+    def restore_runtime_state(self, state: Dict[str, Any]) -> None:
+        path_verts = state.get("path_generator_verts")
+        component_state = {
+            name: value
+            for name, value in state.items()
+            if name != "path_generator_verts"
+        }
+        super().restore_runtime_state(component_state)
+        if path_verts is not None:
+            self.path_generator.verts.copy_(path_verts)
+
     def step(self):
         """No per-step updates needed for path following."""
         pass
@@ -294,4 +310,3 @@ class PathFollowerControl(ControlComponent):
                 ),
             )
         }
-

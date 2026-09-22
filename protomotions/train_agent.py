@@ -241,7 +241,13 @@ def create_parser():
         "--checkpoint",
         type=str,
         default=None,
-        help="Path to checkpoint file to resume from",
+        help=(
+            "Warm-start a new experiment from model weights and embedded "
+            "observation-normalizer buffers. Task-specific reward statistics, "
+            "optimizer state, and counters start fresh. "
+            "To resume, reuse the original experiment name; its last.ckpt "
+            "and optimizer/training state are then restored automatically."
+        ),
     )
     parser.add_argument(
         "--use-wandb",
@@ -850,7 +856,11 @@ def main():
 
     agent.setup()
     agent.fabric.strategy.barrier()
-    agent.load(args.checkpoint)
+    agent.load(
+        args.checkpoint,
+        load_env=(mode == "resume"),
+        resume_training_state=(mode == "resume"),
+    )
 
     # ===================================================================
     # 6. Save Configs (First Run Only - Warm Start or Fresh)
@@ -926,10 +936,6 @@ def main():
         )
 
     agent.fabric.strategy.barrier()
-
-    # Skip first policy update after resume to avoid training spike from full reset
-    if mode == "resume":
-        agent._skip_next_policy_update = True
 
     # ===================================================================
     # 7. Train

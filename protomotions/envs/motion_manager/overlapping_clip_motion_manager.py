@@ -177,37 +177,57 @@ class OverlappingClipMotionManager(MimicMotionManager):
             self.clip_attempts.scatter_add_(0, clip_ids, torch.ones_like(clip_ids))
             failure_values = terminated[done_ids].to(dtype=torch.long)
             self.clip_failures.scatter_add_(0, clip_ids, failure_values)
-            # This happens only at episode ends (normally every 60 steps), so
-            # the small CPU transfer is acceptable and gives an auditable map
-            # from episode/env to the sampled clip.
-            elapsed_steps = torch.round(
-                (self.motion_times[done_ids] - self.clip_starts[clip_ids]) / self.env_dt
-            ).long()
-            for env_id, clip_id, failed, steps in zip(
-                done_ids.detach().cpu().tolist(),
-                clip_ids.detach().cpu().tolist(),
-                failure_values.detach().cpu().tolist(),
-                elapsed_steps.detach().cpu().tolist(),
-            ):
-                self._pending_episode_events.append(
-                    {
-                        "episode_id": self.episode_counter,
-                        "env_id": env_id,
-                        "clip_id": clip_id,
-                        "clip_start_time": float(self.clip_starts[clip_id].item()),
-                        "failed": bool(failed),
-                        "steps": int(steps),
-                    }
-                )
-                self.episode_counter += 1
+            if self.config.record_episode_events:
+                # Optional diagnostic path. Keep it out of normal vectorized
+                # training because these transfers synchronize the GPU and
+                # produce one Python dictionary per completed environment.
+                elapsed_steps = torch.round(
+                    (
+                        self.motion_times[done_ids]
+                        - self.clip_starts[clip_ids]
+                    )
+                    / self.env_dt
+                ).long()
+                for env_id, clip_id, failed, steps in zip(
+                    done_ids.detach().cpu().tolist(),
+                    clip_ids.detach().cpu().tolist(),
+                    failure_values.detach().cpu().tolist(),
+                    elapsed_steps.detach().cpu().tolist(),
+                ):
+                    self._pending_episode_events.append(
+                        {
+                            "episode_id": self.episode_counter,
+                            "env_id": env_id,
+                            "clip_id": clip_id,
+                            "clip_start_time": float(
+                                self.clip_starts[clip_id].item()
+                            ),
+                            "failed": bool(failed),
+                            "steps": int(steps),
+                        }
+                    )
+                    self.episode_counter += 1
 
-        rates = (self.clip_failures.float() + 1.0) / (self.clip_attempts.float() + 2.0)
-        hardest = torch.argmax(rates)
+        smoothed_rates = (self.clip_failures.float() + 1.0) / (
+            self.clip_attempts.float() + 2.0
+        )
+        attempted = self.clip_attempts > 0
+        observed_rates = self.clip_failures.float() / self.clip_attempts.clamp_min(1)
+        observed_rate = self.clip_failures.sum().float() / self.clip_attempts.sum().clamp_min(1)
+        observed_max = torch.where(
+            attempted, observed_rates, torch.zeros_like(observed_rates)
+        ).max()
+        hardest = torch.argmax(smoothed_rates)
         return {
             "clip/current_id_mean": self.current_clip_ids.float().mean(),
             "clip/current_start_s_mean": self.clip_starts[self.current_clip_ids].mean(),
-            "clip/failure_rate_mean": rates.mean(),
-            "clip/failure_rate_max": rates.max(),
+            # Keep the Bayesian prior explicit.  Calling this the observed
+            # failure rate made a run with zero failures appear to start at
+            # 50%, which obscured whether hard termination was actually firing.
+            "clip/failure_rate_smoothed_mean": smoothed_rates.mean(),
+            "clip/failure_rate_smoothed_max": smoothed_rates.max(),
+            "clip/failure_rate_observed": observed_rate,
+            "clip/failure_rate_observed_max": observed_max,
             "clip/hardest_id": hardest.float(),
             "clip/hardest_start_s": self.clip_starts[hardest],
             "clip/attempts_total": self.clip_attempts.sum().float(),
@@ -225,6 +245,23 @@ class OverlappingClipMotionManager(MimicMotionManager):
             }
         )
         return state
+
+    def save_runtime_state(self) -> dict:
+        state = super().save_runtime_state()
+        state.update(
+            {
+                "current_clip_ids": self.current_clip_ids.clone(),
+                "current_clip_end_times": self.current_clip_end_times.clone(),
+                "clip_mode_enabled": self.clip_mode_enabled,
+            }
+        )
+        return state
+
+    def restore_runtime_state(self, state: dict) -> None:
+        super().restore_runtime_state(state)
+        self.current_clip_ids.copy_(state["current_clip_ids"])
+        self.current_clip_end_times.copy_(state["current_clip_end_times"])
+        self.clip_mode_enabled = bool(state["clip_mode_enabled"])
 
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)

@@ -230,7 +230,11 @@ def combine_moments(means: List[Tensor], vars: List[Tensor], counts: List[Tensor
         counts = torch.tensor(counts)
 
     # Convert all inputs to a compatible type for accumulation
-    counts = counts.float()
+    # Long-running pretrained checkpoints can exceed 1e10 observations.
+    # float32 has a spacing of 1024 at that magnitude, so small adaptation
+    # minibatches may otherwise be rounded away entirely.  Means and variances
+    # are already float64; preserve counts at the same precision while merging.
+    counts = counts.to(dtype=torch.float64)
 
     while len(means) > 1:
         new_means, new_vars, new_counts = [], [], []

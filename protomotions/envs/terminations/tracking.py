@@ -29,7 +29,9 @@ Use MdpComponent in experiment configs to bind kernels to context paths:
                 "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
                 "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
             },
-            static_params={"threshold": 0.5},
+            # ``threshold`` is reserved evaluation metadata and is not passed
+            # to kernels. Termination kernels use ``error_threshold``.
+            static_params={"error_threshold": 0.5},
         ),
     }
 
@@ -250,7 +252,7 @@ def relative_body_pos_max_error(
 def compute_tracking_error(
     current_rigid_body_pos: Tensor,
     ref_rigid_body_pos: Tensor,
-    threshold: float = 0.5,
+    error_threshold: float = 0.5,
 ) -> Tensor:
     """Tracking error termination based on max joint position error.
     
@@ -259,14 +261,14 @@ def compute_tracking_error(
     Args:
         current_rigid_body_pos: Current body positions [num_envs, num_bodies, 3].
         ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3].
-        threshold: Maximum joint error threshold in meters.
+        error_threshold: Maximum joint error threshold in meters.
     
     Returns:
         Boolean tensor [num_envs] indicating which envs should terminate.
     """
     gt_per_joint_err = (ref_rigid_body_pos - current_rigid_body_pos).pow(2).sum(-1).sqrt()
     max_joint_err = gt_per_joint_err.max(-1)[0]
-    terminate = max_joint_err > threshold
+    terminate = max_joint_err > error_threshold
     return terminate
 
 
@@ -313,7 +315,7 @@ def compute_anchor_pos_error_term(
     current_anchor_pos: Tensor,
     ref_rigid_body_pos: Tensor,
     anchor_idx: int,
-    threshold: float = 0.5,
+    error_threshold: float = 0.5,
 ) -> Tensor:
     """Anchor position error termination.
     
@@ -324,21 +326,21 @@ def compute_anchor_pos_error_term(
         current_anchor_pos: Current anchor position [num_envs, 3].
         ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3].
         anchor_idx: Index of anchor body.
-        threshold: Maximum allowed distance in meters.
+        error_threshold: Maximum allowed distance in meters.
     
     Returns:
         Boolean tensor [num_envs] indicating which envs should terminate.
     """
     ref_anchor_pos = ref_rigid_body_pos[:, anchor_idx, :]
     distance = (current_anchor_pos - ref_anchor_pos).pow(2).sum(-1).sqrt()
-    return distance > threshold
+    return distance > error_threshold
 
 
 def compute_anchor_ori_error_term(
     current_anchor_rot: Tensor,
     ref_rigid_body_rot: Tensor,
     anchor_idx: int,
-    threshold: float = 0.8,
+    error_threshold: float = 0.8,
 ) -> Tensor:
     """Anchor orientation error termination.
     
@@ -350,7 +352,7 @@ def compute_anchor_ori_error_term(
         current_anchor_rot: Current anchor rotation quaternion [num_envs, 4] (w-last).
         ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4] (w-last).
         anchor_idx: Index of anchor body.
-        threshold: Maximum allowed difference in projected gravity z-component.
+        error_threshold: Maximum allowed difference in projected gravity z-component.
     
     Returns:
         Boolean tensor [num_envs] indicating which envs should terminate.
@@ -368,7 +370,7 @@ def compute_anchor_ori_error_term(
     
     # Compare z-components (how "upright" each is)
     z_diff = torch.abs(proj_grav[:, 2] - ref_proj_grav[:, 2])
-    return z_diff > threshold
+    return z_diff > error_threshold
 
 
 def compute_relative_body_pos_error_term(
@@ -378,7 +380,7 @@ def compute_relative_body_pos_error_term(
     current_anchor_rot: Tensor,
     ref_rigid_body_rot: Tensor,
     anchor_idx: int,
-    threshold: float = 0.25,
+    error_threshold: float = 0.25,
 ) -> Tensor:
     """Relative body position error termination.
     
@@ -393,7 +395,7 @@ def compute_relative_body_pos_error_term(
         current_anchor_rot: Current anchor rotation [num_envs, 4] (w-last).
         ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4] (w-last).
         anchor_idx: Index of anchor body.
-        threshold: Maximum allowed error for any body in meters.
+        error_threshold: Maximum allowed error for any body in meters.
     
     Returns:
         Boolean tensor [num_envs] indicating which envs have any body exceeding threshold.
@@ -433,14 +435,14 @@ def compute_relative_body_pos_error_term(
     per_body_error = (rel_pos - ref_rel_pos).pow(2).sum(dim=-1).sqrt()  # [num_envs, num_bodies]
     
     # Terminate if ANY body exceeds threshold
-    return torch.any(per_body_error > threshold, dim=-1)
+    return torch.any(per_body_error > error_threshold, dim=-1)
 
 
 def compute_anchor_height_error_term(
     current_anchor_pos: Tensor,
     ref_rigid_body_pos: Tensor,
     anchor_idx: int,
-    threshold: float = 0.25,
+    error_threshold: float = 0.25,
 ) -> Tensor:
     """Anchor height (Z-axis) error termination.
 
@@ -451,7 +453,7 @@ def compute_anchor_height_error_term(
         current_anchor_pos: Current anchor position [num_envs, 3].
         ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3].
         anchor_idx: Index of anchor body.
-        threshold: Maximum allowed height error in meters.
+        error_threshold: Maximum allowed height error in meters.
 
     Returns:
         Boolean termination mask [num_envs].
@@ -459,7 +461,7 @@ def compute_anchor_height_error_term(
     height_error = anchor_height_error_value(
         current_anchor_pos, ref_rigid_body_pos, anchor_idx
     )
-    return height_error > threshold
+    return height_error > error_threshold
 
 
 # =============================================================================

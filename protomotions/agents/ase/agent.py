@@ -135,8 +135,14 @@ class ASE(AMP):
 
     def load_parameters(self, state_dict):
         super().load_parameters(state_dict)
-        self.mi_critic_optimizer.load_state_dict(state_dict["mi_critic_optimizer"])
-        if self.config.normalize_rewards:
+        if getattr(self, "_resume_training_state_on_load", True):
+            self.mi_critic_optimizer.load_state_dict(
+                state_dict["mi_critic_optimizer"]
+            )
+        if (
+            self.config.normalize_rewards
+            and getattr(self, "_load_reward_normalization_on_load", True)
+        ):
             self.running_mi_enc_norm.load_state_dict(state_dict["running_mi_enc_norm"])
 
     def get_state_dict(self, state_dict):

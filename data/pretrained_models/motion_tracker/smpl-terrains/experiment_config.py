@@ -100,7 +100,10 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
     return EnvConfig(
         ref_contact_smooth_window=7,
         max_episode_length=1000,
-        num_state_history_steps=2,
+        # The baseline consumes only the immediately previous action.  Keeping
+        # a second full body/history slot doubles reset/history work without
+        # changing any policy input or reward.
+        num_state_history_steps=1,
         control_components=control_components,
         observation_components=observation_components,
         termination_components=termination_components,
@@ -182,6 +185,19 @@ def agent_config(
         gradient_clip_val=50.0,
         clip_critic_loss=True,
         evaluator=MimicEvaluatorConfig(
+            # Full-motion evaluation uses the same simulator as training and
+            # must reset every environment afterwards because PhysX contact
+            # caches cannot be snapshotted exactly.  CRISP evaluates every
+            # 500 epochs; the same cadence avoids repeatedly biasing difficult
+            # single-motion runs toward freshly reset episodes.
+            eval_metrics_every=500,
+            # This interval is counted in evaluations, not epochs.  Save every
+            # evaluation so the checkpoint can be inspected frame by frame.
+            save_predicted_motion_lib_every=1,
+            # Success alone cannot rank checkpoints when every evaluation is
+            # either successful (easy clips) or unsuccessful (hard clips).
+            # Break ties with full-motion tracking and smoothness metrics.
+            quality_checkpoint_score=True,
             evaluation_components={
                 "gt_error": gt_error_factory(threshold=0.5),
                 "gr_error": gr_error_factory(),
@@ -203,6 +219,10 @@ def configure_robot_and_simulator(
     robot_cfg: RobotConfig, simulator_cfg: SimulatorConfig, args: argparse.Namespace
 ):
     """Configure robot to add contact sensors for foot contact tracking."""
+    # The released policy was trained with IsaacLab's implicit robot material
+    # friction of 0.5.  Set it explicitly so IsaacGym does not inherit its
+    # different asset default.
+    simulator_cfg.default_robot_friction = 0.5
     robot_cfg.update_fields(
         contact_bodies=["all_left_foot_bodies", "all_right_foot_bodies"]
     )

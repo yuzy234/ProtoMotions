@@ -55,7 +55,7 @@ combining logic, not by the compute_func itself.  These are automatically filter
 out before calling the compute_func.  Current metadata keys:
 
     weight, multiplicative, zero_during_grace_period,
-    min_value, max_value, use_region_weights
+    min_value, max_value, use_region_weights, threshold, fail_above, log_only
 
 Example
 -------
@@ -108,7 +108,7 @@ if TYPE_CHECKING:
 _METADATA_KEYS = frozenset({
     "weight", "multiplicative", "zero_during_grace_period",
     "min_value", "max_value", "use_region_weights",
-    "threshold", "fail_above",
+    "threshold", "fail_above", "log_only",
 })
 
 

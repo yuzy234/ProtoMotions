@@ -116,3 +116,13 @@ class OverlappingClipMotionManagerConfig(MimicMotionManagerConfig):
             )
         },
     )
+    record_episode_events: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Write one CPU-side JSON event per completed environment. "
+                "Disabled by default because large vectorized runs can build "
+                "millions of Python dictionaries and force GPU synchronization."
+            )
+        },
+    )

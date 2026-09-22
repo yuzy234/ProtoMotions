@@ -26,7 +26,7 @@ Examples:
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Tuple, TYPE_CHECKING
 
 import torch
 from torch import Tensor
@@ -83,6 +83,27 @@ class ControlComponent(ABC):
             env_ids: Indices of environments to reset [num_reset_envs].
         """
         pass
+
+    def save_runtime_state(self) -> Dict[str, Any]:
+        """Snapshot tensor/scalar state mutated by reset() or step()."""
+        state: Dict[str, Any] = {}
+        for name, value in vars(self).items():
+            if name in {"config", "env"}:
+                continue
+            if torch.is_tensor(value):
+                state[name] = value.clone()
+            elif isinstance(value, (bool, int, float, str, type(None))):
+                state[name] = value
+        return state
+
+    def restore_runtime_state(self, state: Dict[str, Any]) -> None:
+        """Restore a snapshot produced by :meth:`save_runtime_state`."""
+        for name, value in state.items():
+            current = getattr(self, name, None)
+            if torch.is_tensor(current) and torch.is_tensor(value):
+                current.copy_(value)
+            else:
+                setattr(self, name, value)
     
     @abstractmethod
     def step(self):
@@ -153,4 +174,3 @@ class ControlComponent(ABC):
             Default implementation returns empty dict.
         """
         return {}
-

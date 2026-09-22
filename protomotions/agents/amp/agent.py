@@ -129,13 +129,17 @@ class AMP(PPO):
 
     def load_parameters(self, state_dict):
         super().load_parameters(state_dict)
-        self.discriminator_optimizer.load_state_dict(
-            state_dict["discriminator_optimizer"]
-        )
-        self.disc_critic_optimizer.load_state_dict(
-            state_dict["disc_critic_optimizer"]
-        )
-        if self.config.normalize_rewards:
+        if getattr(self, "_resume_training_state_on_load", True):
+            self.discriminator_optimizer.load_state_dict(
+                state_dict["discriminator_optimizer"]
+            )
+            self.disc_critic_optimizer.load_state_dict(
+                state_dict["disc_critic_optimizer"]
+            )
+        if (
+            self.config.normalize_rewards
+            and getattr(self, "_load_reward_normalization_on_load", True)
+        ):
             self.running_amp_reward_norm.load_state_dict(
                 state_dict["running_amp_reward_norm"]
             )

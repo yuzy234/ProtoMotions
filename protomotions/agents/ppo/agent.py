@@ -185,11 +185,19 @@ class PPO(BaseAgent):
                 )
                 self.actor.logstd.data = current_logstd
 
-        self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
-        self.critic_optimizer.load_state_dict(state_dict["critic_optimizer"])
+        resume_training_state = getattr(
+            self, "_resume_training_state_on_load", True
+        )
+        if resume_training_state:
+            self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
+            self.critic_optimizer.load_state_dict(state_dict["critic_optimizer"])
 
         # Restore adaptive LR state
-        if self.config.adaptive_lr.enabled and "adaptive_lr" in state_dict:
+        if (
+            resume_training_state
+            and self.config.adaptive_lr.enabled
+            and "adaptive_lr" in state_dict
+        ):
             self.actor_lr = state_dict["adaptive_lr"]["actor_lr"]
             self.critic_lr = state_dict["adaptive_lr"]["critic_lr"]
             for param_group in self.actor_optimizer.param_groups:
@@ -201,6 +209,7 @@ class PPO(BaseAgent):
         if (
             self.config.advantage_normalization.enabled
             and self.config.advantage_normalization.use_ema
+            and resume_training_state
         ):
             if "adv_mean_ema" in state_dict:
                 self.adv_mean_ema.copy_(state_dict["adv_mean_ema"])
@@ -319,62 +328,73 @@ class PPO(BaseAgent):
             Dictionary of training metrics (losses, clip fraction, etc.).
         """
         iter_log_dict = {}
-        # Update actor
-        actor_loss, actor_loss_dict = self.actor_step(batch_dict)
-        iter_log_dict.update(actor_loss_dict)
-
-        # Adaptive learning rate based on KL divergence
-        if self.config.adaptive_lr.enabled and "actor/kl" in actor_loss_dict:
-            self._update_learning_rate(actor_loss_dict["actor/kl"])
-            iter_log_dict["info/actor_lr"] = torch.tensor(
-                self.actor_lr, device=self.device
-            )
-            iter_log_dict["info/critic_lr"] = torch.tensor(
-                self.critic_lr, device=self.device
-            )
-
-        # Check if we should skip actor update for this epoch
-        # Once triggered, skip all remaining batches (same distribution)
-        if (
-            not self._skip_actor_for_epoch
-            and self.config.actor_clip_frac_threshold is not None
-        ):
-            clip_frac = actor_loss_dict["actor/clip_frac"].item()
-            # Synchronize clip_frac across all GPUs
-            if self.fabric.world_size > 1 and torch.distributed.is_initialized():
-                clip_frac_tensor = torch.tensor(clip_frac, device=self.device)
-                torch.distributed.all_reduce(
-                    clip_frac_tensor, op=torch.distributed.ReduceOp.SUM
-                )
-                clip_frac = (clip_frac_tensor / self.fabric.world_size).item()
-
-            if clip_frac > self.config.actor_clip_frac_threshold:
-                self._skip_actor_for_epoch = True
-                if self.fabric.global_rank == 0:
-                    log.warning(
-                        f"Epoch {self.current_epoch}: Skipping actor updates for remaining batches "
-                        f"(clip_frac {clip_frac:.3f} > {self.config.actor_clip_frac_threshold})"
-                    )
-
-        if not self._skip_actor_for_epoch:
-            self.actor_optimizer.zero_grad(set_to_none=True)
-            self.fabric.backward(actor_loss)
-            actor_grad_clip_dict = handle_model_grad_clipping(
-                config=self.config,
-                fabric=self.fabric,
-                model=self.actor,
-                optimizer=self.actor_optimizer,
-                model_name="actor",
-            )
-            iter_log_dict.update(actor_grad_clip_dict)
-            self.actor_optimizer.step()
-            iter_log_dict["actor/update_skipped"] = torch.tensor(
-                0.0, device=self.device
-            )
-        else:
+        # Once this rollout has left PPO's trust region, later actor
+        # minibatches cannot produce a valid update.  Do not keep running the
+        # six-layer actor for updates that are guaranteed to be discarded;
+        # critic learning remains independent below.
+        if self._skip_actor_for_epoch:
             iter_log_dict["actor/update_skipped"] = torch.tensor(
                 1.0, device=self.device
             )
+        else:
+            actor_loss, actor_loss_dict = self.actor_step(batch_dict)
+            iter_log_dict.update(actor_loss_dict)
+
+            if self.config.adaptive_lr.enabled and "actor/kl" in actor_loss_dict:
+                self._update_learning_rate(actor_loss_dict["actor/kl"])
+                iter_log_dict["info/actor_lr"] = torch.tensor(
+                    self.actor_lr, device=self.device
+                )
+                iter_log_dict["info/critic_lr"] = torch.tensor(
+                    self.critic_lr, device=self.device
+                )
+
+            if self.config.actor_clip_frac_threshold is not None:
+                clip_frac = actor_loss_dict["actor/clip_frac"].item()
+                if self.fabric.world_size > 1:
+                    batch_size = batch_dict["action"].shape[0]
+                    clip_sum = torch.tensor(
+                        clip_frac * batch_size,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                    clip_count = torch.tensor(
+                        batch_size, device=self.device, dtype=torch.float32
+                    )
+                    all_sums = self.fabric.all_gather(clip_sum)
+                    all_counts = self.fabric.all_gather(clip_count)
+                    clip_frac = (all_sums.sum() / all_counts.sum()).item()
+
+                if clip_frac > self.config.actor_clip_frac_threshold:
+                    self._skip_actor_for_epoch = True
+                    if self.fabric.global_rank == 0:
+                        log.warning(
+                            "Epoch %d: skipping actor updates for remaining "
+                            "batches (clip_frac %.3f > %.3f)",
+                            self.current_epoch,
+                            clip_frac,
+                            self.config.actor_clip_frac_threshold,
+                        )
+
+            if self._skip_actor_for_epoch:
+                iter_log_dict["actor/update_skipped"] = torch.tensor(
+                    1.0, device=self.device
+                )
+            else:
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                self.fabric.backward(actor_loss)
+                actor_grad_clip_dict = handle_model_grad_clipping(
+                    config=self.config,
+                    fabric=self.fabric,
+                    model=self.actor,
+                    optimizer=self.actor_optimizer,
+                    model_name="actor",
+                )
+                iter_log_dict.update(actor_grad_clip_dict)
+                self.actor_optimizer.step()
+                iter_log_dict["actor/update_skipped"] = torch.tensor(
+                    0.0, device=self.device
+                )
 
         # Update critic
         critic_loss, critic_loss_dict = self.critic_step(batch_dict)

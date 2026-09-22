@@ -800,7 +800,16 @@ def main():
     )
 
     agent.setup()
-    agent.load(args.checkpoint, load_env=False)
+    # Inference needs policy/value weights and normalization only. Loading
+    # Adam moments and historical training counters wastes memory and time.
+    agent.load(
+        args.checkpoint,
+        load_env=False,
+        resume_training_state=False,
+        # Critic-based one-step evaluation/CEM needs values in the checkpoint's
+        # reward-normalized coordinate system, but never needs Adam or counters.
+        load_reward_normalization=True,
+    )
 
     try:
         if args.full_eval:

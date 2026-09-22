@@ -430,6 +430,17 @@ class MotionManager:
         # Apply exclusions after updating weights
         self._apply_motion_exclusions()
 
+    def save_runtime_state(self) -> dict:
+        """Snapshot episode-local playback state without curriculum weights."""
+        return {
+            "motion_ids": self.motion_ids.clone(),
+            "motion_times": self.motion_times.clone(),
+        }
+
+    def restore_runtime_state(self, state: dict) -> None:
+        self.motion_ids.copy_(state["motion_ids"])
+        self.motion_times.copy_(state["motion_times"])
+
     def get_state_dict(self):
         state_dict = {
             "motion_file_name": self.motion_lib.motion_file,

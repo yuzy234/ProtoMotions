@@ -1024,6 +1024,7 @@ def reference_feasible_lift_metric_factory(
         },
         static_params={
             "weight": 0.0,
+            "log_only": True,
             "clearance_margin": clearance_margin,
             "max_lift": max_lift,
         },
@@ -1046,7 +1047,7 @@ def reference_penetration_metric_factory(*, fraction: bool = False) -> MdpCompon
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
             "ref_ground_heights": EnvContext.mimic.ref_ground_heights,
         },
-        static_params={"weight": 0.0},
+        static_params={"weight": 0.0, "log_only": True},
     )
 
 
@@ -1388,7 +1389,10 @@ def tracking_error_term_factory(threshold: float = 0.5) -> MdpComponent:
             "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
         },
-        static_params={"threshold": threshold},
+        # ``threshold`` is reserved evaluation metadata in MdpComponent and is
+        # intentionally not forwarded to compute functions.  Termination
+        # kernels therefore use the unambiguous ``error_threshold`` name.
+        static_params={"error_threshold": threshold},
     )
 
 
@@ -1625,7 +1629,7 @@ def anchor_pos_error_term_factory(threshold: float = 0.5) -> MdpComponent:
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
             "anchor_idx": EnvContext.mimic.anchor_idx,
         },
-        static_params={"threshold": threshold},
+        static_params={"error_threshold": threshold},
     )
 
 
@@ -1647,7 +1651,7 @@ def anchor_ori_error_term_factory(threshold: float = 0.8) -> MdpComponent:
             "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
             "anchor_idx": EnvContext.mimic.anchor_idx,
         },
-        static_params={"threshold": threshold},
+        static_params={"error_threshold": threshold},
     )
 
 
@@ -1672,7 +1676,7 @@ def relative_body_pos_error_term_factory(threshold: float = 0.25) -> MdpComponen
             "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
             "anchor_idx": EnvContext.mimic.anchor_idx,
         },
-        static_params={"threshold": threshold},
+        static_params={"error_threshold": threshold},
     )
 
 
@@ -1696,7 +1700,7 @@ def anchor_height_error_term_factory(threshold: float = 0.25) -> MdpComponent:
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
             "anchor_idx": EnvContext.mimic.anchor_idx,
         },
-        static_params={"threshold": threshold},
+        static_params={"error_threshold": threshold},
     )
 
 

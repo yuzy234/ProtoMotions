@@ -86,11 +86,12 @@ class MimicEvaluator(BaseEvaluator):
 
         # Cache env + motion manager state (restored in cleanup_after_evaluation)
         self._env_snapshot = self.env.save_state()
-        self._cached_motion_ids = self.motion_manager.motion_ids.clone()
-        self._cached_motion_times = self.motion_manager.motion_times.clone()
-        self._cached_clip_mode = None
+        self._cached_motion_manager_runtime = (
+            self.motion_manager.save_runtime_state()
+        )
+        self._cached_collect_raw_state_extras = self.env.collect_raw_state_extras
+        self.env.collect_raw_state_extras = True
         if hasattr(self.motion_manager, "set_clip_mode"):
-            self._cached_clip_mode = self.motion_manager.clip_mode_enabled
             # Periodic evaluation must run the complete reference motion, not
             # stop at the two-second training-window boundary.
             self.motion_manager.set_clip_mode(False)
@@ -120,13 +121,20 @@ class MimicEvaluator(BaseEvaluator):
 
         self._save_failed_motions(failed_motions, self.agent.current_epoch)
 
+        # A cold-start evaluation can still run when periodic evaluation is
+        # disabled (``eval_metrics_every=None``).  That evaluation represents
+        # one sampling-weight update, not a ``None``-length interval.
+        eval_interval = self.config.eval_metrics_every
+        if eval_interval is None:
+            eval_interval = 1
+
         success_discount = math.pow(
             self.config.motion_weights_rules.motion_weights_update_success_discount,
-            self.config.eval_metrics_every,
+            eval_interval,
         )
         failure_discount = math.pow(
             self.config.motion_weights_rules.motion_weights_update_failure_discount,
-            self.config.eval_metrics_every,
+            eval_interval,
         )
         new_weights = self.env.motion_manager.motion_weights.clone()
         new_weights[success_motions] *= success_discount
@@ -210,7 +218,7 @@ class MimicEvaluator(BaseEvaluator):
             if contact_alpha is not None and actions.shape[-1] == len(dof_names):
                 contact_forces = (
                     self.env.simulator.get_robot_state().rigid_body_contact_forces
-                )
+                )[env_ids]
                 for side in ("L", "R"):
                     action_ids = side_action_ids[side]
                     body_ids = side_contact_body_ids[side]
@@ -239,9 +247,52 @@ class MimicEvaluator(BaseEvaluator):
 
         self._on_episode_start(env_ids)
 
+        # Fixed-motion runs often evaluate only one actor.  Keeping every other
+        # replicated humanoid alive wastes most evaluation physics and can
+        # overflow PhysX's pair budget, which silently drops real contacts.
+        if (
+            self.config.park_inactive_envs
+            and self.env.simulator.supports_inactive_env_parking
+            and env_ids.numel() < self.num_envs
+        ):
+            active = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device
+            )
+            active[env_ids] = True
+            inactive_env_ids = torch.nonzero(~active, as_tuple=False).flatten()
+            self.env.simulator.park_envs(inactive_env_ids)
+            # Root/DOF tensor writes do not immediately update articulated
+            # child-body transforms in Isaac Gym.  Without one unscored sync
+            # step, the first evaluated step still broadphases all inactive
+            # humanoids at their old scene positions.  This made the same
+            # policy produce radically different metrics at 1, 1024 and 2048
+            # environments.  The active actors are reset immediately below,
+            # and cleanup restores the exact pre-evaluation snapshot.
+            sync_actions = torch.zeros(
+                self.num_envs,
+                self.env.robot_config.number_of_actions,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.env.simulator.step(sync_actions, markers_callback=None)
+
         obs, _ = self.env.reset(env_ids, **self._get_reset_kwargs())
         obs = self.agent.add_agent_info_to_obs(obs)
-        obs_td = self.agent.obs_dict_to_tensordict(obs)
+
+        def policy_observations(observations):
+            return self.agent.obs_dict_to_tensordict(observations)[env_ids]
+
+        obs_td = policy_observations(obs)
+
+        def expand_actions(policy_actions: Tensor) -> Tensor:
+            full_actions = torch.zeros(
+                self.num_envs,
+                policy_actions.shape[-1],
+                dtype=policy_actions.dtype,
+                device=policy_actions.device,
+            )
+            full_actions[env_ids] = policy_actions
+            return full_actions
 
         prev_actions = None
 
@@ -250,9 +301,12 @@ class MimicEvaluator(BaseEvaluator):
         # spawn before the motion and trajectory metrics begin.
         for _ in range(self.config.eval_pre_roll_steps):
             model_outs = self.agent.model(obs_td)
-            actions = model_outs.get("mean_action", model_outs.get("action"))
+            active_actions = model_outs.get("mean_action", model_outs.get("action"))
             if ema_alpha is not None or adaptive_enabled:
-                actions, prev_actions = smooth_actions(actions, prev_actions)
+                active_actions, prev_actions = smooth_actions(
+                    active_actions, prev_actions
+                )
+            actions = expand_actions(active_actions)
             self.env.step(actions)
             self.motion_manager.motion_times[env_ids] = 0.0
             # The step computed observations at t=dt. Rebuild them at the held
@@ -261,7 +315,7 @@ class MimicEvaluator(BaseEvaluator):
             self.env.compute_observations(context=self.env.context)
             obs = self.env.get_obs()
             obs = self.agent.add_agent_info_to_obs(obs)
-            obs_td = self.agent.obs_dict_to_tensordict(obs)
+            obs_td = policy_observations(obs)
 
         # Pre-roll intentionally pins the public reference time to zero.  An
         # adaptive phase controller also carries a previous-rate prior, so
@@ -283,21 +337,27 @@ class MimicEvaluator(BaseEvaluator):
 
         for step_idx in range(max_steps):
             model_outs = self.agent.model(obs_td)
-            actions = model_outs.get("mean_action", model_outs.get("action"))
+            active_actions = model_outs.get("mean_action", model_outs.get("action"))
             if "root_pos_residual_scaled" in model_outs and hasattr(
                 self.env, "set_reference_root_residual"
             ):
-                self.env.set_reference_root_residual(
-                    model_outs["root_pos_residual_scaled"]
+                full_residual = torch.zeros_like(
+                    self.env.reference_root_residual
                 )
+                full_residual[env_ids] = model_outs["root_pos_residual_scaled"]
+                self.env.set_reference_root_residual(full_residual)
 
             # Apply EMA smoothing (deployment simulation)
             if ema_alpha is not None or adaptive_enabled:
-                actions, prev_actions = smooth_actions(actions, prev_actions)
+                active_actions, prev_actions = smooth_actions(
+                    active_actions, prev_actions
+                )
+
+            actions = expand_actions(active_actions)
 
             obs, rewards, dones, terminated, extras = self.env.step(actions)
             obs = self.agent.add_agent_info_to_obs(obs)
-            obs_td = self.agent.obs_dict_to_tensordict(obs)
+            obs_td = policy_observations(obs)
 
             self._episode_active_mask = active_mask.clone()
             self._check_eval_components(env_ids, step_idx)
@@ -462,16 +522,15 @@ class MimicEvaluator(BaseEvaluator):
 
     def cleanup_after_evaluation(self) -> None:
         """Restore env and motion manager state after evaluation."""
-        self.motion_manager.motion_ids = self._cached_motion_ids
-        self.motion_manager.motion_times = self._cached_motion_times
-        if self._cached_clip_mode is not None:
-            self.motion_manager.set_clip_mode(self._cached_clip_mode)
+        self.motion_manager.restore_runtime_state(
+            self._cached_motion_manager_runtime
+        )
+        self.env.collect_raw_state_extras = self._cached_collect_raw_state_extras
         self.env.restore_state(self._env_snapshot)
         
         del self._env_snapshot
-        del self._cached_motion_ids
-        del self._cached_motion_times
-        del self._cached_clip_mode
+        del self._cached_motion_manager_runtime
+        del self._cached_collect_raw_state_extras
         if hasattr(self, "_episode_active_mask"):
             del self._episode_active_mask
         super().cleanup_after_evaluation()

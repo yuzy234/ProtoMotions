@@ -93,6 +93,19 @@ class ControlManager:
         """
         for component in self.components.values():
             component.reset(env_ids)
+
+    def save_runtime_state(self) -> Dict[str, Any]:
+        """Snapshot every control component's mutable runtime state."""
+        return {
+            name: component.save_runtime_state()
+            for name, component in self.components.items()
+        }
+
+    def restore_runtime_state(self, state: Dict[str, Any]) -> None:
+        """Restore control-component state captured before evaluation."""
+        for name, component_state in state.items():
+            if name in self.components:
+                self.components[name].restore_runtime_state(component_state)
     
     def check_resets_and_terminations(self) -> Tuple[Tensor, Tensor]:
         """Check control component-specific reset and termination conditions.

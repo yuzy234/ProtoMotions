@@ -68,6 +68,11 @@ from protomotions.simulator.base_simulator.record import RecordingMixin
 
 
 class Simulator(RecordingMixin, ABC):
+    # Parking is a PhysX-specific workaround for replicated actors sharing one
+    # broadphase. Backends with isolated worlds should leave inactive actors in
+    # place rather than simulate them in unbounded free fall below the scene.
+    supports_inactive_env_parking: bool = False
+
     """Base class for physics simulators.
 
     Provides a unified interface for different physics engines (IsaacGym, IsaacLab, Genesis, Newton).
@@ -441,7 +446,8 @@ class Simulator(RecordingMixin, ABC):
         self._proj_sim_time = torch.zeros(self.num_envs, device=self.device)
 
         self._create_projectiles(self._proj_config)
-        self._hide_all_projectiles()
+        if N > 0:
+            self._hide_all_projectiles()
 
     def _throw_projectile(self) -> None:
         """J-key handler: launch next projectile cube at each robot.
@@ -452,6 +458,8 @@ class Simulator(RecordingMixin, ABC):
         3. Lead the target by adding robot XY velocity to launch velocity
         """
         cfg = self._proj_config
+        if cfg.num_projectiles == 0:
+            return
         all_env_ids = torch.arange(self.num_envs, device=self.device)
         cube_idx = self._proj_next_idx.clone()
 
@@ -503,6 +511,8 @@ class Simulator(RecordingMixin, ABC):
 
     def _update_projectiles(self) -> None:
         """Timer-based hiding of expired projectiles."""
+        if self._proj_config.num_projectiles == 0:
+            return
         self._proj_sim_time += self.dt
         elapsed = self._proj_sim_time.unsqueeze(1) - self._proj_throw_time
         expired_mask = (elapsed > self._proj_config.hide_delay) & (
@@ -528,7 +538,8 @@ class Simulator(RecordingMixin, ABC):
         self._proj_sim_time[env_ids] = 0.0
         self._proj_throw_time[env_ids] = float("-inf")
         self._proj_next_idx[env_ids] = 0
-        self._hide_projectiles_for_envs(env_ids)
+        if self._proj_config.num_projectiles > 0:
+            self._hide_projectiles_for_envs(env_ids)
 
     def _hide_all_projectiles(self) -> None:
         """Move all projectiles underground."""
@@ -645,6 +656,22 @@ class Simulator(RecordingMixin, ABC):
             return self._common_actions[env_ids]
         return self._common_actions
 
+    def save_action_state(self) -> Dict[str, torch.Tensor]:
+        """Snapshot actuator history that influences future physics steps."""
+        return {
+            "common_actions": self._common_actions.clone(),
+            "previous_actions": self._previous_actions.clone(),
+            "prev_prev_actions": self._prev_prev_actions.clone(),
+            "steps_since_reset": self._steps_since_reset.clone(),
+        }
+
+    def restore_action_state(self, state: Dict[str, torch.Tensor]) -> None:
+        """Restore actuator history after an interrupting evaluation."""
+        self._common_actions.copy_(state["common_actions"])
+        self._previous_actions.copy_(state["previous_actions"])
+        self._prev_prev_actions.copy_(state["prev_prev_actions"])
+        self._steps_since_reset.copy_(state["steps_since_reset"])
+
     def step(
         self,
         common_actions: torch.Tensor,
@@ -723,6 +750,69 @@ class Simulator(RecordingMixin, ABC):
 
         # Reset projectiles for reset environments
         self._reset_projectiles(env_ids)
+
+    def park_envs(
+        self,
+        env_ids: torch.Tensor,
+        hide_z: float = -50.0,
+    ) -> None:
+        """Move inactive evaluation environments below the collision scene.
+
+        A fixed-motion evaluation may use one environment while thousands of
+        replicated humanoids remain active.  Parking the unused actors removes
+        them from PhysX broadphase/narrowphase work and prevents pair-capacity
+        overflow from silently dropping contacts in the environment being
+        evaluated.  ``BaseEnv.restore_state`` restores them after evaluation.
+        """
+        from protomotions.simulator.base_simulator.simulator_state import (
+            StateConversion,
+        )
+
+        if env_ids is None or env_ids.numel() == 0:
+            return
+
+        num_parked = env_ids.numel()
+        current_root = self.get_root_state(env_ids)
+        root_pos = current_root.root_pos.clone()
+        root_pos[:, 2] = hide_z
+        zero_root_vel = torch.zeros(
+            (num_parked, 3), device=self.device, dtype=torch.float32
+        )
+        dof_pos = self.robot_config.default_dof_pos.unsqueeze(0).repeat(
+            num_parked, 1
+        ).to(device=self.device, dtype=torch.float32)
+        dof_vel = torch.zeros_like(dof_pos)
+
+        park_state = ResetState(
+            root_pos=root_pos,
+            root_rot=current_root.root_rot.clone(),
+            root_vel=zero_root_vel,
+            root_ang_vel=zero_root_vel.clone(),
+            dof_pos=dof_pos,
+            dof_vel=dof_vel,
+            state_conversion=StateConversion.COMMON,
+        )
+
+        park_object_state = None
+        if self.scene_lib.num_objects_per_scene > 0:
+            current_obj = self.get_object_root_state(env_ids)
+            object_pos = current_obj.root_pos.clone()
+            object_pos[..., 2] = hide_z - 1.0
+            num_objects = self.scene_lib.num_objects_per_scene
+            zero_object_vel = torch.zeros(
+                (num_parked, num_objects, 3),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            park_object_state = ObjectState(
+                root_pos=object_pos,
+                root_rot=current_obj.root_rot.clone(),
+                root_vel=zero_object_vel,
+                root_ang_vel=zero_object_vel.clone(),
+                state_conversion=StateConversion.COMMON,
+            )
+
+        self.reset_envs(park_state, park_object_state, env_ids)
 
     @abstractmethod
     def _set_simulator_env_state(

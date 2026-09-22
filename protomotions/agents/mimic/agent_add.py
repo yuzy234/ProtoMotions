@@ -49,12 +49,14 @@ class MimicADD(AMP):
             )
         )
         ref_ground_heights = self.env.terrain.get_ground_heights(
-            ref_state_gt[:, 0]
+            ref_state_gt[:, self.env.robot_config.anchor_body_index]
         ).clone()
 
         current_state = self.env.simulator.get_bodies_state()
         ground_heights = self.env.terrain.get_ground_heights(
-            current_state.rigid_body_pos[:, 0]
+            current_state.rigid_body_pos[
+                :, self.env.robot_config.anchor_body_index
+            ]
         ).clone()
 
         # ADD uses local_obs=False for tracking diff observations

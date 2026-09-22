@@ -82,6 +82,7 @@ class StateHistoryBuffer:
         anchor_body_index: int,
         device: torch.device,
         store_noisy: bool = False,
+        track_full_state: bool = True,
     ):
         self.num_envs = num_envs
         self.num_history_steps = num_history_steps
@@ -91,7 +92,11 @@ class StateHistoryBuffer:
         self.num_contact_bodies = num_contact_bodies
         self.anchor_body_index = anchor_body_index
         self.device = device
-        self.store_noisy = store_noisy
+        self.track_full_state = track_full_state
+        # Noisy body history is useful only when body/DOF history itself is
+        # consumed.  An action-only tracker must still apply noise to the
+        # current observation, but it need not duplicate historical bodies.
+        self.store_noisy = store_noisy and track_full_state
         
         buffer_size = num_history_steps + 1
         
@@ -138,7 +143,7 @@ class StateHistoryBuffer:
         )
         
         # Noisy buffers - only allocated if store_noisy=True
-        if store_noisy:
+        if self.store_noisy:
             self.noisy_rigid_body_pos = torch.zeros(
                 num_envs, buffer_size, num_bodies, 3,
                 dtype=torch.float, device=device
@@ -176,6 +181,32 @@ class StateHistoryBuffer:
             self.noisy_dof_pos = self.dof_pos
             self.noisy_dof_vel = self.dof_vel
             self.noisy_ground_heights = self.ground_heights
+
+    @torch.no_grad()
+    def rotate_actions(
+        self,
+        actions: Tensor,
+        processed_actions: Optional[Tensor] = None,
+    ) -> None:
+        """Advance only action history.
+
+        The standard terrain tracker consumes one previous policy action and
+        no historical body/DOF fields.  Rolling every robot-state tensor in
+        that case is pure memory traffic, so this lightweight path updates
+        exactly the fields visible to the configured components.
+        """
+        self.actions = self.actions.roll(shifts=1, dims=1)
+        self.processed_actions = self.processed_actions.roll(shifts=1, dims=1)
+        self.actions[:, 0] = actions
+        self.processed_actions[:, 0] = (
+            processed_actions if processed_actions is not None else actions
+        )
+
+    @torch.no_grad()
+    def reset_actions(self, env_ids: Tensor) -> None:
+        """Clear action history for the selected environments."""
+        self.actions[env_ids] = 0.0
+        self.processed_actions[env_ids] = 0.0
     
     @property
     def historical_rigid_body_pos(self) -> Tensor:
@@ -371,6 +402,10 @@ class StateHistoryBuffer:
             noisy_dof_vel: Optional noisy DOF velocities [envs, num_dofs].
             noisy_ground_heights: Optional noisy ground heights [envs].
         """
+        if not self.track_full_state:
+            self.rotate_actions(actions, processed_actions)
+            return
+
         # Roll all clean tensors: shift history back by 1 (index 0 becomes 1, etc.)
         self.rigid_body_pos = self.rigid_body_pos.roll(shifts=1, dims=1)
         self.rigid_body_rot = self.rigid_body_rot.roll(shifts=1, dims=1)
@@ -445,6 +480,10 @@ class StateHistoryBuffer:
             body_contacts: Historical body contacts [len(env_ids), steps, num_contact_bodies].
             actions: Historical actions [len(env_ids), steps, action_dim] or None to zero.
         """
+        if not self.track_full_state:
+            self.reset_actions(env_ids)
+            return
+
         self.rigid_body_pos[env_ids] = rigid_body_pos
         self.rigid_body_rot[env_ids] = rigid_body_rot
         self.rigid_body_vel[env_ids] = rigid_body_vel
@@ -501,6 +540,10 @@ class StateHistoryBuffer:
             ground_heights: Current ground heights [len(env_ids)].
             body_contacts: Current body contacts [len(env_ids), num_contact_bodies].
         """
+        if not self.track_full_state:
+            self.reset_actions(env_ids)
+            return
+
         buffer_size = self.rigid_body_pos.shape[1]
         
         # Expand tensors for clean buffers
@@ -542,18 +585,24 @@ class StateHistoryBuffer:
             Dictionary mapping tensor names to cloned tensors.
         """
         state = {
+            'actions': self.actions.clone(),
+            'processed_actions': self.processed_actions.clone(),
+            'store_noisy': self.store_noisy,
+            'track_full_state': self.track_full_state,
+        }
+        if not self.track_full_state:
+            return state
+
+        state.update({
             'rigid_body_pos': self.rigid_body_pos.clone(),
             'rigid_body_rot': self.rigid_body_rot.clone(),
             'rigid_body_vel': self.rigid_body_vel.clone(),
             'rigid_body_ang_vel': self.rigid_body_ang_vel.clone(),
             'dof_pos': self.dof_pos.clone(),
             'dof_vel': self.dof_vel.clone(),
-            'actions': self.actions.clone(),
-            'processed_actions': self.processed_actions.clone(),
             'ground_heights': self.ground_heights.clone(),
             'body_contacts': self.body_contacts.clone(),
-            'store_noisy': self.store_noisy,
-        }
+        })
         if self.store_noisy:
             state['noisy_rigid_body_pos'] = self.noisy_rigid_body_pos.clone()
             state['noisy_rigid_body_rot'] = self.noisy_rigid_body_rot.clone()
@@ -570,17 +619,20 @@ class StateHistoryBuffer:
         Args:
             state: Dictionary from save_state() containing buffer tensors.
         """
+        self.actions.copy_(state['actions'])
+        if 'processed_actions' in state:
+            self.processed_actions.copy_(state['processed_actions'])
+        else:
+            self.processed_actions.copy_(state['actions'])  # Fallback for old checkpoints
+        if not self.track_full_state:
+            return
+
         self.rigid_body_pos.copy_(state['rigid_body_pos'])
         self.rigid_body_rot.copy_(state['rigid_body_rot'])
         self.rigid_body_vel.copy_(state['rigid_body_vel'])
         self.rigid_body_ang_vel.copy_(state['rigid_body_ang_vel'])
         self.dof_pos.copy_(state['dof_pos'])
         self.dof_vel.copy_(state['dof_vel'])
-        self.actions.copy_(state['actions'])
-        if 'processed_actions' in state:
-            self.processed_actions.copy_(state['processed_actions'])
-        else:
-            self.processed_actions.copy_(state['actions'])  # Fallback for old checkpoints
         self.ground_heights.copy_(state['ground_heights'])
         self.body_contacts.copy_(state['body_contacts'])
         if self.store_noisy and state.get('store_noisy', False):
@@ -591,4 +643,3 @@ class StateHistoryBuffer:
             self.noisy_dof_pos.copy_(state['noisy_dof_pos'])
             self.noisy_dof_vel.copy_(state['noisy_dof_vel'])
             self.noisy_ground_heights.copy_(state['noisy_ground_heights'])
-

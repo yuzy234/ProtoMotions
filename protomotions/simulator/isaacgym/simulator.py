@@ -56,6 +56,8 @@ import tempfile
 
 
 class IsaacGymSimulator(Simulator):
+    supports_inactive_env_parking: bool = True
+
     # ===== Group 1: Initialization & Configuration =====
     def __init__(
         self,
@@ -500,6 +502,7 @@ class IsaacGymSimulator(Simulator):
 
         # Load the base humanoid asset
         self._humanoid_asset = humanoid_asset = self._load_humanoid_asset()
+        self._set_robot_friction_on_asset(humanoid_asset)
 
         # Create multiple asset variants for friction domain randomization if needed
         self._humanoid_assets_for_friction = self._create_friction_randomized_assets(
@@ -1428,6 +1431,13 @@ class IsaacGymSimulator(Simulator):
     # ===== Group 6: Domain Randomization =====
     # - IsaacGym: Must set friction on asset before actor creation
     #   Solution: Create min(num_buckets, num_envs) assets, evenly distribute to environments
+
+    def _set_robot_friction_on_asset(self, asset) -> None:
+        """Set the configured baseline friction on every robot shape."""
+        shape_props = self._gym.get_asset_rigid_shape_properties(asset)
+        for shape_prop in shape_props:
+            shape_prop.friction = self.config.default_robot_friction
+        self._gym.set_asset_rigid_shape_properties(asset, shape_props)
 
     def _create_friction_randomized_assets(self, base_asset) -> List:
         """Create multiple asset copies with different friction/restitution values for domain randomization.

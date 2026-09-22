@@ -271,7 +271,10 @@ class MaskedMimic(BaseAgent):
 
     def load_parameters(self, state_dict):
         super().load_parameters(state_dict)
-        self.maskedmimic_optimizer.load_state_dict(state_dict["maskedmimic_optimizer"])
+        if getattr(self, "_resume_training_state_on_load", True):
+            self.maskedmimic_optimizer.load_state_dict(
+                state_dict["maskedmimic_optimizer"]
+            )
 
     # -----------------------------
     # Training Loop and Dataset Processing

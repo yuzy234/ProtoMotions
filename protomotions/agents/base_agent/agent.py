@@ -150,9 +150,6 @@ class BaseAgent:
         self.fit_start_time = None
         self.best_evaluated_score = None
 
-        # Hacky flag to skip policy update right after eval to avoid training spikes
-        self._skip_next_policy_update = False
-
         # Set root_dir: use logger's root_dir if available, otherwise use passed parameter
         if self.fabric.loggers:
             self.root_dir = Path(self.fabric.loggers[0].root_dir)
@@ -211,7 +208,13 @@ class BaseAgent:
     def create_optimizers(self, model: nn.Module):
         pass
 
-    def load(self, checkpoint: Path, load_env: bool = True):
+    def load(
+        self,
+        checkpoint: Path,
+        load_env: bool = True,
+        resume_training_state: bool = True,
+        load_reward_normalization: Optional[bool] = None,
+    ):
         if checkpoint is not None:
             self.fabric.call("on_load_checkpoint_start")
             path_before_resolve = Path(checkpoint)
@@ -221,11 +224,17 @@ class BaseAgent:
             state_dict = torch.load(
                 checkpoint, map_location=self.device, weights_only=False
             )
+            self._resume_training_state_on_load = resume_training_state
+            self._load_reward_normalization_on_load = (
+                resume_training_state
+                if load_reward_normalization is None
+                else load_reward_normalization
+            )
             self.load_parameters(state_dict)
 
             self.just_loaded_checkpoint_should_evaluate = True
 
-            if load_env:
+            if load_env and resume_training_state:
                 # Load env state from the same directory as the checkpoint.
                 task_id = self.env.get_task_id()
                 env_checkpoint = self.root_dir / f"env_{task_id}.ckpt"
@@ -241,24 +250,38 @@ class BaseAgent:
     def load_parameters(self, state_dict):
         """Load agent parameters from state dictionary.
 
-        Restores training state including epoch counter, step count, timing info,
-        best scores, normalization statistics, and model weights.
+        Always restores model weights, including observation-normalizer buffers.
+        For a true resume, also restores optimizer-independent training state
+        such as reward normalization, counters, timing, and early stopping. A
+        warm start deliberately keeps those task-specific fields fresh.
 
         Args:
             state_dict: Dictionary containing saved agent state from checkpoint.
                        Expected keys: epoch, step_count, run_start_time, best_evaluated_score,
                        running_reward_norm (if normalization enabled), model.
         """
-        self.current_epoch = state_dict["epoch"]
+        if getattr(self, "_resume_training_state_on_load", True):
+            self.current_epoch = state_dict["epoch"]
 
-        if "step_count" in state_dict:
-            self.step_count = state_dict["step_count"]
-        if "run_start_time" in state_dict:
-            self.fit_start_time = state_dict["run_start_time"]
+            if "step_count" in state_dict:
+                self.step_count = state_dict["step_count"]
+            if "run_start_time" in state_dict:
+                self.fit_start_time = state_dict["run_start_time"]
 
-        self.best_evaluated_score = state_dict.get("best_evaluated_score", None)
+            self.best_evaluated_score = state_dict.get(
+                "best_evaluated_score", None
+            )
+            self._early_stop_best_score = state_dict.get(
+                "early_stop_best_score", None
+            )
+            self._early_stop_bad_evals = int(
+                state_dict.get("early_stop_bad_evals", 0)
+            )
 
-        if self.config.normalize_rewards:
+        if (
+            self.config.normalize_rewards
+            and getattr(self, "_load_reward_normalization_on_load", True)
+        ):
             self.running_reward_norm.load_state_dict(state_dict["running_reward_norm"])
 
         self.model.load_state_dict(state_dict["model"])
@@ -284,6 +307,8 @@ class BaseAgent:
             "step_count": self.step_count,
             "run_start_time": self.fit_start_time,
             "best_evaluated_score": self.best_evaluated_score,
+            "early_stop_best_score": self._early_stop_best_score,
+            "early_stop_bad_evals": self._early_stop_bad_evals,
         }
 
         if self.config.normalize_rewards:
@@ -447,11 +472,37 @@ class BaseAgent:
         self.experience_buffer.register_key("dones", dtype=torch.long)
         self.register_algorithm_experience_buffer_keys()
 
+        # Full raw trajectories are needed by evaluation/export, not by PPO
+        # rollout optimization.  MimicEvaluator temporarily re-enables them.
+        self.env.collect_raw_state_extras = False
+
         # Force reset on fit start
         done_indices = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         if self.fit_start_time is None:
             self.fit_start_time = time.time()
         self.fabric.call("on_fit_start", self)
+
+        # ``just_loaded_checkpoint_should_evaluate`` previously ran only after
+        # the first PPO update, so the reported "initial" score could already
+        # include a destructive single-clip fine-tuning step.  Evaluate the
+        # loaded policy before collecting any training data, then restore the
+        # exact environment/action state and begin epoch zero.
+        if self.evaluator is not None and self.just_loaded_checkpoint_should_evaluate:
+            self.fabric.call("on_eval_start", self)
+            eval_log_dict, evaluated_score = self.evaluator.evaluate()
+            evaluated_score = self.fabric.broadcast(evaluated_score, src=0)
+            self.fabric.call("on_eval_end", self)
+
+            if evaluated_score is not None:
+                if (
+                    self.best_evaluated_score is None
+                    or evaluated_score >= self.best_evaluated_score
+                ):
+                    self.best_evaluated_score = evaluated_score
+                    self.save(checkpoint_name="last.ckpt", new_high_score=True)
+            self._update_metric_early_stopping(eval_log_dict, evaluated_score)
+            self.fabric.log_dict(eval_log_dict, step=self.current_epoch)
+            self.just_loaded_checkpoint_should_evaluate = False
 
         while self.current_epoch < self.max_epochs:
             self.epoch_start_time = time.time()
@@ -585,16 +636,7 @@ class BaseAgent:
 
                 self.normalize_rewards_in_buffer()
 
-            # Skip policy update right after eval to avoid training spikes (hacky fix)
-            if self._skip_next_policy_update:
-                training_log_dict = {"skipped_policy_update": 1.0}
-                self._skip_next_policy_update = False
-                # Still need to preprocess dataset (compute advantages/returns) before clearing
-                self.pre_process_dataset()
-                # Clear the experience buffer to reset for next epoch
-                _ = self.experience_buffer.make_dict()
-            else:
-                training_log_dict = self.optimize_model()
+            training_log_dict = self.optimize_model()
 
             training_log_dict["epoch"] = self.current_epoch
             self.current_epoch += 1
@@ -620,13 +662,9 @@ class BaseAgent:
                     and self.current_epoch % self.evaluator.config.eval_metrics_every
                     == 0
                 )
-                or self.just_loaded_checkpoint_should_evaluate
             ):
                 self.fabric.call("on_eval_start", self)
 
-                is_first_eval_after_checkpoint_load = (
-                    self.just_loaded_checkpoint_should_evaluate
-                )
                 eval_log_dict, evaluated_score = self.evaluator.evaluate()
                 evaluated_score = self.fabric.broadcast(evaluated_score, src=0)
                 self.fabric.call("on_eval_end", self)
@@ -640,20 +678,14 @@ class BaseAgent:
                         self.save(checkpoint_name="last.ckpt", new_high_score=True)
                 self._update_metric_early_stopping(eval_log_dict, evaluated_score)
                 training_log_dict.update(eval_log_dict)
-                # A warm-started adaptation can peak immediately (for example,
-                # epoch 41 after loading epoch 40).  Periodic checkpointing at
-                # multiples of 10 would otherwise make that policy impossible
-                # to cold-evaluate or select later.
-                if (
-                    is_first_eval_after_checkpoint_load
-                    and self.config.save_epoch_checkpoint_every is not None
-                ):
-                    self.save(checkpoint_name=f"epoch_{self.current_epoch}.ckpt")
-                self.just_loaded_checkpoint_should_evaluate = False
-
-                # Skip next policy update to avoid training spikes after eval (hacky fix)
-                self._skip_next_policy_update = True
-
+                if self.evaluator.config.reset_training_envs_after_eval:
+                    # Root/DOF tensors can be restored, but PhysX's contact
+                    # warm-start and broadphase caches cannot.  Restart all
+                    # episodes at this rollout boundary instead of mixing a
+                    # restored policy state with evaluation-era solver state.
+                    done_indices = torch.arange(
+                        self.num_envs, device=self.device, dtype=torch.long
+                    )
             self.post_epoch_logging(training_log_dict)
             if self.config.max_episode_length_manager is not None:
                 max_episode_length = (

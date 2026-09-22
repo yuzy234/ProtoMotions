@@ -494,7 +494,10 @@ class PushDomainRandomizationConfig:
 class ProjectileConfig:
     """Configuration for projectile cube throwing (J-key perturbation)."""
 
-    num_projectiles: int = 5
+    # Projectiles are an interactive inference feature. Creating a pool for
+    # every parallel training environment adds dynamic actors and PhysX
+    # contact-patch pressure even when the J key is never used.
+    num_projectiles: int = 0
     cube_half_size_range: Tuple[float, float] = (0.05, 0.15)  # per-pool-index size
     density: float = 500.0  # kg/m^3
     speed_range: Tuple[float, float] = (30.0, 40.0)  # m/s (ASE uses 30-40)
@@ -566,6 +569,13 @@ class SimulatorConfig:
     w_last: bool = field(
         default=None,
         metadata={"help": "Quaternion format: True for xyzw, False for wxyz."},
+    )
+    default_robot_friction: float = field(
+        default=1.0,
+        metadata={
+            "help": "Friction coefficient assigned to character collision shapes.",
+            "min": 0.0,
+        },
     )
     headless: bool = field(
         default=None, metadata={"help": "Run without GUI visualization."}
